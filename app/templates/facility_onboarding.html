@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p class="muted">Onboard a facility into the FHIR Organization master list. You can prefill from NHFR CSV then assign your own Organization ID.</p>
+  <div class="field-row">
+    <div><label>NHFR search</label><input id="qNhfr" placeholder="Search by name or code"></div>
+    <div><label>Province</label><input id="qProvince" placeholder="optional"></div>
+    <div><label>City / Municipality</label><input id="qCity" placeholder="optional"></div>
+    <div style="align-self:end"><button id="btnNhfrSearch" type="button">Find NHFR rows</button></div>
+  </div>
+  <div id="nhfrHint" class="hint"></div>
+</div>
+
+<div class="card">
+  <table>
+    <thead><tr><th>Facility</th><th>NHFR/HCPN</th><th>Phone</th><th>Location</th><th></th></tr></thead>
+    <tbody id="nhfrBody"><tr><td colspan="5" class="muted">Search NHFR to prefill fields.</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Organization Payload</h2>
+  <form id="onboardForm">
+    <div class="field-row">
+      <div><label>Organization ID (optional)</label><input id="inOrgId" name="organization_id" placeholder="leave blank to auto-generate"></div>
+      <div><label>Name (required)</label><input id="inName" name="name" required></div>
+      <div><label>Active</label><select id="inActive" name="active"><option value="true">true</option><option value="false">false</option></select></div>
+    </div>
+    <div class="field-row">
+      <div><label>NHFR identifier</label><input id="inNhfr" name="nhfr_identifier"></div>
+      <div><label>HCPN identifier</label><input id="inHcpn" name="hcpn_identifier"></div>
+      <div><label>Phone</label><input id="inPhone" name="phone"></div>
+    </div>
+    <div class="field-row">
+      <div><label>City</label><input id="inCity" name="city"></div>
+      <div><label>Province</label><input id="inProvince" name="province"></div>
+      <div><label>Address text</label><input id="inAddressText" name="address_text"></div>
+    </div>
+    <div class="btn-row">
+      <button type="submit">Create / Update Organization</button>
+    </div>
+  </form>
+</div>
+
+<div class="card" id="onboardResultCard" style="display:none">
+  <h2>Onboarding Result</h2>
+  <div id="onboardResultIssues"></div>
+  <div class="json-viewer" id="onboardResultJson"></div>
+</div>
+
+<script>
+async function searchNhfr() {
+  const q = document.getElementById('qNhfr').value.trim();
+  const province = document.getElementById('qProvince').value.trim();
+  const city = document.getElementById('qCity').value.trim();
+  const qp = ['limit=80'];
+  if (q) qp.push('q=' + encodeURIComponent(q));
+  if (province) qp.push('province=' + encodeURIComponent(province));
+  if (city) qp.push('city=' + encodeURIComponent(city));
+
+  const body = document.getElementById('nhfrBody');
+  body.innerHTML = '<tr><td colspan="5" class="muted">Loading...</td></tr>';
+  try {
+    const data = await API.get('/api/onboarding/nhfr?' + qp.join('&'));
+    const rows = data.facilities || [];
+    document.getElementById('nhfrHint').textContent = `${rows.length} NHFR row(s).`;
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="5" class="muted">No results.</td></tr>';
+      return;
+    }
+    body.innerHTML = rows.map((f) => `<tr>
+      <td>${escapeHtml(f.name || '')}</td>
+      <td>${escapeHtml(f.code || '')}</td>
+      <td>${escapeHtml(f.phone || '')}</td>
+      <td>${escapeHtml([f.city, f.province].filter(Boolean).join(', '))}</td>
+      <td><button type="button" class="btn-secondary btn-sm" data-json="${encodeURIComponent(JSON.stringify(f))}">Use</button></td>
+    </tr>`).join('');
+
+    body.querySelectorAll('button[data-json]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const facility = JSON.parse(decodeURIComponent(btn.dataset.json || '{}'));
+        prefill(facility);
+      });
+    });
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="5"><div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div></td></tr>';
+  }
+}
+
+function prefill(f) {
+  document.getElementById('inName').value = f.name || '';
+  document.getElementById('inNhfr').value = f.nhfr_identifier || f.code || '';
+  document.getElementById('inHcpn').value = f.hcpn_identifier || f.code || '';
+  document.getElementById('inPhone').value = f.phone || '';
+  document.getElementById('inCity').value = f.city || '';
+  document.getElementById('inProvince').value = f.province || '';
+  document.getElementById('inAddressText').value = [f.city, f.province].filter(Boolean).join(', ');
+}
+
+document.getElementById('btnNhfrSearch').addEventListener('click', searchNhfr);
+document.getElementById('onboardForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const payload = {
+    organization_id: document.getElementById('inOrgId').value.trim(),
+    name: document.getElementById('inName').value.trim(),
+    active: document.getElementById('inActive').value === 'true',
+    nhfr_identifier: document.getElementById('inNhfr').value.trim(),
+    hcpn_identifier: document.getElementById('inHcpn').value.trim(),
+    phone: document.getElementById('inPhone').value.trim(),
+    city: document.getElementById('inCity').value.trim(),
+    province: document.getElementById('inProvince').value.trim(),
+    address_text: document.getElementById('inAddressText').value.trim(),
+  };
+
+  try {
+    const result = await API.send('POST', '/api/onboarding/facility', payload);
+    document.getElementById('onboardResultCard').style.display = '';
+    document.getElementById('onboardResultIssues').innerHTML = '<div class="issue information">Organization saved.</div>';
+    document.getElementById('onboardResultJson').textContent = JSON.stringify(result, null, 2);
+    toast('Facility onboarded', 'ok');
+  } catch (err) {
+    document.getElementById('onboardResultCard').style.display = '';
+    document.getElementById('onboardResultIssues').innerHTML = '<div class="issue">' + escapeHtml(fhirErrorMessage(err)) + '</div>';
+    document.getElementById('onboardResultJson').textContent = JSON.stringify((err.data || {}), null, 2);
+    toast('Onboarding failed', 'err');
+  }
+});
+</script>
+{% endblock %}

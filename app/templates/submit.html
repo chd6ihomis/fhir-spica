@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p class="muted">Encode an eReferral and submit it as a single atomic FHIR transaction Bundle.
+  The form starts blank by default; use <strong>Load Ana Reyes defaults</strong> if you want the sample case prefilled.
+  Coded fields and the address hierarchy are populated live from the Terminology and PSA servers.</p>
+  <div class="btn-row">
+    <button type="button" class="btn-secondary" id="btnDefaults">Load Ana Reyes defaults</button>
+    <button type="button" class="btn-ghost" id="btnResetForm">Reset form</button>
+    <button type="button" class="btn-ghost" id="btnDedup">Check for duplicate patient</button>
+  </div>
+  <div id="prefillStatus" class="hint"></div>
+  <div id="dedupResult"></div>
+</div>
+
+<form id="referralForm">
+  <p class="hint"><strong>Required fields</strong> are marked with an asterisk (*) and must be completed before submission.</p>
+  <fieldset>
+    <legend>Patient</legend>
+    <div class="field-row">
+      <div><label>Family name</label><input name="patient_family" required></div>
+      <div><label>Given name(s)</label><input name="patient_given" required></div>
+      <div><label>Sex (administrative gender) <span class="source-tag"></span></label><select name="patient_gender" required></select></div>
+      <div><label>Birth date</label><input type="date" name="patient_birthdate" required></div>
+    </div>
+    <div class="field-row">
+      <div><label>PhilSys ID</label><input name="philsys_id" required></div>
+      <div><label>PhilHealth ID</label><input name="philhealth_id" required></div>
+      <div><label>Mobile phone</label><input name="patient_phone" type="tel" placeholder="e.g. +639171234567"></div>
+    </div>
+    <div class="field-row">
+      <div><label>Address line</label><input name="patient_line"></div>
+      <div><label>Postal code</label><input name="patient_postal"></div>
+    </div>
+    <div class="field-row">
+      <div><label>Region <span class="source-tag"></span></label><select name="region_code" id="selRegion" required></select></div>
+      <div><label>Province</label><select name="province_code" id="selProvince" required></select></div>
+      <div><label>City / Municipality</label><select name="city_code" id="selCity" required></select></div>
+      <div><label>Barangay</label><select name="barangay_code" id="selBarangay" required></select></div>
+    </div>
+    <input type="hidden" name="region_display" id="inRegionDisplay">
+    <input type="hidden" name="province_display" id="inProvinceDisplay">
+    <input type="hidden" name="city_display" id="inCityDisplay">
+    <input type="hidden" name="barangay_display" id="inBarangayDisplay">
+    <div class="field-row">
+      <div>
+        <label>Next of kin relationship <span class="source-tag" id="kinSourceTag"></span></label>
+        <div class="field-row">
+          <div><input id="inContactRelationshipQuery" placeholder="No relationship selected" readonly required></div>
+          <div style="align-self:end"><button type="button" class="btn-secondary" id="btnKinSearch">Search</button></div>
+        </div>
+        <input type="hidden" name="contact_relationship" id="inContactRelationshipCode">
+        <input type="hidden" name="contact_relationship_display" id="inContactRelationshipDisplay">
+        <input type="hidden" name="contact_relationship_system" id="inContactRelationshipSystem">
+        <div class="hint" id="kinRelationshipHint"></div>
+      </div>
+      <div><label>Next of kin family name</label><input name="contact_family"></div>
+      <div><label>Next of kin given name</label><input name="contact_given"></div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Practitioners &amp; Facilities</legend>
+    <div class="facility-grid">
+      <section class="facility-col">
+        <h3 class="facility-col-title">Referring facility (selected in top bar)</h3>
+        <div>
+          <label>Referring facility search</label>
+          <div class="field-row">
+            <div><input id="inRefFacilitySearch" placeholder="No facility selected" readonly></div>
+            <div style="align-self:end"><button type="button" class="btn-secondary" id="btnRefFacilitySearch">Search</button></div>
+          </div>
+          <div class="hint" id="refFacilityHint"></div>
+        </div>
+        <div class="field-row">
+          <div><label>Referring facility name</label><input name="referring_org_name" readonly></div>
+          <div><label>Referring NHFR code</label><input name="referring_org_nhfr" readonly required></div>
+        </div>
+        <div class="field-row">
+          <div><label>Referring HCPN identifier</label><input name="referring_org_hcpn" readonly></div>
+          <div><label>Referring facility phone</label><input name="referring_org_phone"></div>
+        </div>
+        <input type="hidden" name="referring_org_address_text" id="inRefOrgAddressText">
+        <input type="hidden" name="referring_org_postal" id="inRefOrgPostal">
+        <input type="hidden" name="referring_org_region_code" id="inRefOrgRegionCode">
+        <input type="hidden" name="referring_org_region_display" id="inRefOrgRegionDisplay">
+        <input type="hidden" name="referring_org_province_code" id="inRefOrgProvinceCode">
+        <input type="hidden" name="referring_org_province_display" id="inRefOrgProvinceDisplay">
+        <input type="hidden" name="referring_org_city_code" id="inRefOrgCityCode">
+        <input type="hidden" name="referring_org_city_display" id="inRefOrgCityDisplay">
+        <input type="hidden" name="referring_org_barangay_code" id="inRefOrgBarangayCode">
+        <input type="hidden" name="referring_org_barangay_display" id="inRefOrgBarangayDisplay">
+        <div>
+          <label>Referring practitioner</label>
+          <div class="field-row">
+            <div><input id="inRefPractitionerSearch" placeholder="Search by name or PRC"></div>
+            <div style="align-self:end"><button type="button" class="btn-secondary" id="btnRefPractitionerSearch">Search</button></div>
+          </div>
+          <div class="hint" id="refPractitionerHint"></div>
+        </div>
+        <div class="field-row">
+          <div><label>Referring practitioner family</label><input name="referring_prac_family" required></div>
+          <div><label>Referring practitioner given</label><input name="referring_prac_given" required></div>
+          <div><label>Referring PRC number</label><input name="referring_prac_prc" required></div>
+        </div>
+        <div>
+          <label>Referring practitioner role <span class="source-tag" id="refRoleSourceTag"></span></label>
+          <select name="referring_role_code" id="inRefRoleCode" required></select>
+          <input type="hidden" name="referring_role_display" id="inRefRoleDisplay">
+          <div class="hint" id="refRoleHint"></div>
+        </div>
+      </section>
+
+      <section class="facility-col">
+        <h3 class="facility-col-title">Receiving facility</h3>
+        <div>
+          <label>Receiving facility search</label>
+          <div class="field-row">
+            <div><input id="inRecFacilitySearch" placeholder="Search by name or NHFR code" readonly></div>
+            <div style="align-self:end"><button type="button" class="btn-secondary" id="btnRecFacilitySearch">Search</button></div>
+          </div>
+          <div class="hint" id="recFacilityHint"></div>
+        </div>
+        <div class="field-row">
+          <div><label>Receiving facility name</label><input name="receiving_org_name" readonly></div>
+          <div><label>Receiving NHFR code</label><input name="receiving_org_nhfr" readonly required></div>
+        </div>
+        <div class="field-row">
+          <div><label>Receiving HCPN identifier</label><input name="receiving_org_hcpn" readonly></div>
+          <div><label>Receiving facility phone</label><input name="receiving_org_phone"></div>
+        </div>
+        <input type="hidden" name="receiving_org_address_text" id="inRecOrgAddressText">
+        <input type="hidden" name="receiving_org_postal" id="inRecOrgPostal">
+        <input type="hidden" name="receiving_org_region_code" id="inRecOrgRegionCode">
+        <input type="hidden" name="receiving_org_region_display" id="inRecOrgRegionDisplay">
+        <input type="hidden" name="receiving_org_province_code" id="inRecOrgProvinceCode">
+        <input type="hidden" name="receiving_org_province_display" id="inRecOrgProvinceDisplay">
+        <input type="hidden" name="receiving_org_city_code" id="inRecOrgCityCode">
+        <input type="hidden" name="receiving_org_city_display" id="inRecOrgCityDisplay">
+        <input type="hidden" name="receiving_org_barangay_code" id="inRecOrgBarangayCode">
+        <input type="hidden" name="receiving_org_barangay_display" id="inRecOrgBarangayDisplay">
+        <div>
+          <label>Receiving practitioner</label>
+          <div class="field-row">
+            <div><input id="inRecPractitionerSearch" placeholder="Search by name or PRC"></div>
+            <div style="align-self:end"><button type="button" class="btn-secondary" id="btnRecPractitionerSearch">Search</button></div>
+          </div>
+          <div class="hint" id="recPractitionerHint"></div>
+        </div>
+        <div class="field-row">
+          <div><label>Receiving practitioner family</label><input name="receiving_prac_family" required></div>
+          <div><label>Receiving practitioner given</label><input name="receiving_prac_given" required></div>
+          <div><label>Receiving PRC number</label><input name="receiving_prac_prc" required></div>
+        </div>
+        <div>
+          <label>Receiving practitioner role <span class="source-tag" id="recRoleSourceTag"></span></label>
+          <select name="receiving_role_code" id="inRecRoleCode" required></select>
+          <input type="hidden" name="receiving_role_display" id="inRecRoleDisplay">
+          <div class="hint" id="recRoleHint"></div>
+        </div>
+      </section>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Referral details</legend>
+    <div class="field-row">
+      <div><label>Referral category <span class="source-tag"></span></label><select name="referral_category_code" id="selCategory" required></select></div>
+      <div><label>Reason for referral (service type) <span class="source-tag"></span></label><select name="reason_code" id="selReason" required></select></div>
+    </div>
+    <input type="hidden" name="referral_category_display" id="inReferralCategoryDisplay">
+    <input type="hidden" name="reason_display" id="inReasonDisplay">
+    <div class="field-row">
+      <div><label>Date of referral / authored</label><input type="datetime-local" name="authored_on" id="inAuthoredOn" required></div>
+      <div><label>Time called</label><input type="datetime-local" name="time_called" id="inTimeCalled" required></div>
+    </div>
+    <div><label>Task note</label><textarea name="task_note"></textarea></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Clinical data</legend>
+    <div><label>Chief complaint</label><input name="chief_complaint_text" required></div>
+    <div>
+      <label>Search chief complaint concept (Ontoserver $expand)</label>
+      <div class="field-row">
+        <div><input id="inChiefSearch" placeholder="No concept selected" readonly></div>
+        <div style="align-self:end"><button type="button" class="btn-secondary" id="btnChiefSearch">Search</button></div>
+      </div>
+      <div class="hint" id="chiefSearchHint"></div>
+    </div>
+    <div class="field-row">
+      <div>
+        <label>Chief complaint SNOMED code</label>
+        <input name="chief_complaint_code" id="inChiefCode" placeholder="e.g. 386661006" required>
+        <div class="snomed-result" id="resChiefCode"></div>
+      </div>
+      <div><label>Chief complaint display</label><input name="chief_complaint_display" id="inChiefDisplay"></div>
+    </div>
+    <div><label>Clinical history</label><textarea name="clinical_history"></textarea></div>
+    <div>
+      <label>Search diagnosis concept (Ontoserver $expand)</label>
+      <div class="field-row">
+        <div><input id="inDiagSearch" placeholder="No concept selected" readonly></div>
+        <div style="align-self:end"><button type="button" class="btn-secondary" id="btnDiagSearch">Search</button></div>
+      </div>
+      <div class="hint" id="diagSearchHint"></div>
+    </div>
+    <div class="field-row">
+      <div>
+        <label>Diagnosis SNOMED code</label>
+        <input name="diagnosis_code" id="inDiagCode" placeholder="e.g. 44054006" required>
+        <div class="snomed-result" id="resDiagCode"></div>
+      </div>
+      <div><label>Diagnosis display</label><input name="diagnosis_display" id="inDiagDisplay"></div>
+    </div>
+    <div><label>Working impression</label><textarea name="working_impression" required></textarea></div>
+    <div class="field-row">
+      <div><label>BP systolic (mmHg)</label><input type="number" name="bp_systolic"></div>
+      <div><label>BP diastolic (mmHg)</label><input type="number" name="bp_diastolic"></div>
+      <div><label>Heart rate (/min)</label><input type="number" name="heart_rate"></div>
+      <div><label>Respiratory rate (/min)</label><input type="number" name="resp_rate"></div>
+    </div>
+    <div class="field-row">
+      <div><label>SpO₂ (%)</label><input type="number" name="spo2"></div>
+      <div><label>Temperature (°C)</label><input type="number" step="0.1" name="temperature"></div>
+      <div><label>Weight (kg) *</label><input type="number" step="0.1" name="weight" required></div>
+    </div>
+    <div><label>Treatment given</label><textarea name="treatment_given"></textarea></div>
+    <div><label>Laboratory results (text)</label><input name="lab_text"></div>
+  </fieldset>
+
+  <div class="btn-row">
+    <button type="button" id="btnPreview" class="btn-secondary">Preview Bundle</button>
+    <button type="button" id="btnOpenModules" class="btn-ghost" title="Open the granular module console seeded with the current form (inspect each FHIR operation, fetch existing master records, debug structure).">Open Module Console</button>
+    <button type="submit" id="btnSubmit">Submit eReferral</button>
+  </div>
+</form>
+
+<div class="card" id="previewCard" style="display:none">
+  <h2>Transaction Bundle <span class="muted" id="entryCount"></span></h2>
+  <div class="json-viewer" id="previewJson"></div>
+</div>
+
+<div class="card" id="resultCard" style="display:none">
+  <h2>Submission result</h2>
+  <div id="resultIssues"></div>
+  <div id="createdList"></div>
+  <h2>Server response</h2>
+  <div class="json-viewer" id="resultJson"></div>
+</div>
+
+<div id="termModal" class="modal-overlay" style="display:none" role="dialog" aria-modal="true">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="termModalTitle">Terminology search</h2>
+      <button class="btn-ghost" id="btnCloseTermModal" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row">
+        <div><input id="termModalQuery" placeholder="Type at least 2 characters to search"></div>
+        <div style="align-self:end"><button id="btnTermModalSearch" type="button">Search</button></div>
+      </div>
+      <p id="termModalStatus" class="hint"></p>
+      <table>
+        <thead><tr><th>Display</th><th>Code</th><th>System</th><th></th></tr></thead>
+        <tbody id="termModalResults"><tr><td colspan="4" class="muted">No results yet.</td></tr></tbody>
+      </table>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" id="btnCloseTermModal2" type="button">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/submit.js?v=20260625b"></script>
+{% endblock %}

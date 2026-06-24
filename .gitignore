@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local runtime config (written by the Admin portal) and secrets
+config/runtime-config.json
+.env
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.coverage

@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Welcome to the PHeRef Portal</h2>
+  <p class="muted">
+    A UI-based Health Information Exchange for the Philippine eReferral (PHeRef) Connectathon.
+    All clinical data is read from and written to the configured FHIR Transactional Server —
+    the portal stores no local clinical records.
+  </p>
+</div>
+
+<div class="stat-grid">
+  <div class="stat"><div class="num" id="statRequested">–</div><div class="lbl">Pending referrals (requested)</div></div>
+  <div class="stat"><div class="num" id="statReceived">–</div><div class="lbl">Received / in triage</div></div>
+  <div class="stat"><div class="num" id="statAccepted">–</div><div class="lbl">Accepted</div></div>
+  <div class="stat"><div class="num" id="statCompleted">–</div><div class="lbl">Completed</div></div>
+</div>
+
+<div class="card">
+  <h2>Environment</h2>
+  <dl class="kv">
+    <dt>FHIR Transactional Server</dt><dd id="envFhir">{{ config.fhir_base_url }}</dd>
+    <dt>Terminology Server</dt><dd id="envTx">{{ config.terminology_base_url }}</dd>
+    <dt>PSA Classification API</dt><dd>{{ config.psa_base_url }} ({{ config.psa_version }})</dd>
+    <dt>Server status</dt><dd id="envStatus" class="muted">checking…</dd>
+  </dl>
+  <div class="btn-row">
+    <a class="btn" href="/submit">Submit a referral</a>
+    <a class="btn btn-secondary" href="/worklist">Open worklist</a>
+    <a class="btn btn-ghost" href="/admin">Configure servers</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Connectathon quick reference</h2>
+  <p class="muted">Workflow: <strong>requested → received → accepted → completed</strong>
+  (optional: rejected / referred-onward). Submission is a single atomic 20-entry
+  transaction Bundle (7 master-data PUTs + 13 clinical POSTs).</p>
+</div>
+
+<script>
+async function loadDashboard() {
+  try {
+    const h = await API.get('/api/health');
+    const el = document.getElementById('envStatus');
+    if (h.fhir && h.fhir.reachable) {
+      el.textContent = 'Connected · ' + (h.fhir.software || 'FHIR server');
+      el.className = '';
+    } else {
+      el.textContent = 'Unreachable · ' + ((h.fhir && h.fhir.error) || 'no response');
+      el.className = 'muted';
+    }
+  } catch (e) {
+    const el = document.getElementById('envStatus');
+    if (el) { el.textContent = 'Error: ' + (e.message || 'could not reach portal API'); el.className = 'muted'; }
+  }
+
+  const map = { requested: 'statRequested', received: 'statReceived', accepted: 'statAccepted', completed: 'statCompleted' };
+  for (const [status, id] of Object.entries(map)) {
+    try {
+      const data = await API.get('/api/referrals?status=' + status + '&count=200');
+      document.getElementById(id).textContent = data.total != null ? data.total : (data.referrals || []).length;
+    } catch (e) { document.getElementById(id).textContent = '!'; }
+  }
+}
+loadDashboard();
+</script>
+{% endblock %}

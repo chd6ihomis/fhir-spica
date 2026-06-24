@@ -1,0 +1,420 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p class="muted">Patient masterlist retrieved live from the FHIR Transactional Server.
+  Use this to look up existing patients before submitting a referral.</p>
+  <div class="field-row">
+    <div><label>Name</label><input id="qName" placeholder="e.g. Reyes"></div>
+    <div><label>Identifier (value or system|value)</label><input id="qId" placeholder="e.g. 7731-0812-4491-0326"></div>
+    <div style="align-self:end">
+      <label style="display:flex;align-items:center;gap:6px;font-weight:normal;margin-bottom:6px">
+        <input type="checkbox" id="chkAllFacilities"> Show all facilities
+      </label>
+      <button id="btnSearch">Search</button>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <table id="patientTable">
+    <thead>
+      <tr>
+        <th data-k="name">Name</th>
+        <th data-k="gender">Sex</th>
+        <th data-k="birthDate">Birth date</th>
+        <th>Identifiers</th>
+        <th>Referring facility</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="patientBody"><tr><td colspan="6" class="muted">Search to load patients…</td></tr></tbody>
+  </table>
+</div>
+
+<!-- Patient detail modal -->
+<div id="patientModal" class="modal-overlay" style="display:none" role="dialog" aria-modal="true">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2 id="modalTitle">Patient Details</h2>
+      <button class="btn-ghost" id="btnCloseModal" aria-label="Close">✕</button>
+    </div>
+    <div id="modalBody" class="modal-body">
+      <p class="muted">Loading…</p>
+    </div>
+    <div class="modal-footer">
+      <a id="btnModalReferral" class="button" href="#" style="display:none">➕ Start eReferral</a>
+      <button class="btn-ghost" id="btnCloseModal2">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let patients = [];
+const OBS_CHART_COLORS = ['#0c6e29', '#2563eb', '#b45309', '#b91c1c'];
+
+function observationGroupKey(obs) {
+  return [obs.system || '', obs.code || '', obs.display || obs.value || 'Observation'].join('|');
+}
+
+function observationLabel(obs) {
+  return obs.display || obs.code || 'Observation';
+}
+
+function observationTimestamp(iso) {
+  if (!iso) return 0;
+  const ts = Date.parse(iso);
+  return Number.isNaN(ts) ? 0 : ts;
+}
+
+function groupObservations(observations) {
+  const groups = new Map();
+  [...(observations || [])]
+    .sort((a, b) => observationTimestamp(b.effectiveDateTime) - observationTimestamp(a.effectiveDateTime))
+    .forEach(obs => {
+      const key = observationGroupKey(obs);
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          code: obs.code || '',
+          system: obs.system || '',
+          label: observationLabel(obs),
+          entries: [],
+        });
+      }
+      groups.get(key).entries.push(obs);
+    });
+
+  return [...groups.values()].map(group => {
+    const seriesMap = new Map();
+    group.entries.forEach(entry => {
+      if (Array.isArray(entry.components) && entry.components.length) {
+        entry.components.forEach(component => {
+          if (typeof component.value !== 'number') return;
+          const seriesKey = component.code || component.display;
+          if (!seriesMap.has(seriesKey)) {
+            seriesMap.set(seriesKey, {
+              key: seriesKey,
+              label: component.display || component.code || 'Value',
+              unit: component.unit || '',
+              points: [],
+            });
+          }
+          seriesMap.get(seriesKey).points.push({
+            at: entry.effectiveDateTime || '',
+            ts: observationTimestamp(entry.effectiveDateTime),
+            value: component.value,
+          });
+        });
+        return;
+      }
+
+      if (typeof entry.numericValue === 'number') {
+        const seriesKey = group.code || group.label;
+        if (!seriesMap.has(seriesKey)) {
+          seriesMap.set(seriesKey, {
+            key: seriesKey,
+            label: group.label,
+            unit: entry.unit || '',
+            points: [],
+          });
+        }
+        seriesMap.get(seriesKey).points.push({
+          at: entry.effectiveDateTime || '',
+          ts: observationTimestamp(entry.effectiveDateTime),
+          value: entry.numericValue,
+        });
+      }
+    });
+
+    const series = [...seriesMap.values()]
+      .map(item => ({ ...item, points: item.points.sort((a, b) => a.ts - b.ts) }))
+      .filter(item => item.points.length);
+
+    return { ...group, series, latest: group.entries[0] || null };
+  }).sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function buildLinePath(points, projectX, projectY) {
+  return points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${projectX(point.ts)} ${projectY(point.value)}`).join(' ');
+}
+
+function renderObservationChart(group) {
+  const series = group.series || [];
+  if (!series.length) return '';
+
+  const allPoints = series.flatMap(item => item.points);
+  const width = 640;
+  const height = 180;
+  const padding = { top: 16, right: 18, bottom: 28, left: 42 };
+  const values = allPoints.map(point => point.value);
+  const times = allPoints.map(point => point.ts).filter(Boolean);
+  let minValue = Math.min(...values);
+  let maxValue = Math.max(...values);
+  if (minValue === maxValue) {
+    minValue -= 1;
+    maxValue += 1;
+  }
+  const minTime = times.length ? Math.min(...times) : 0;
+  const maxTime = times.length ? Math.max(...times) : minTime;
+  const innerWidth = width - padding.left - padding.right;
+  const innerHeight = height - padding.top - padding.bottom;
+
+  const projectX = ts => {
+    if (!times.length || minTime === maxTime) return padding.left + innerWidth / 2;
+    return padding.left + ((ts - minTime) / (maxTime - minTime)) * innerWidth;
+  };
+  const projectY = value => padding.top + (maxValue - value) / (maxValue - minValue) * innerHeight;
+
+  const gridLines = [0, 0.5, 1].map(step => {
+    const value = maxValue - (maxValue - minValue) * step;
+    const y = padding.top + innerHeight * step;
+    return `<g>
+      <line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" stroke="#dbe4ee" stroke-dasharray="4 4"></line>
+      <text x="${padding.left - 8}" y="${y + 4}" text-anchor="end" class="obs-chart-axis">${escapeHtml(value.toFixed(1).replace(/\.0$/, ''))}</text>
+    </g>`;
+  }).join('');
+
+  const timeLabels = times.length
+    ? `<g>
+        <text x="${padding.left}" y="${height - 6}" text-anchor="start" class="obs-chart-axis">${escapeHtml(formatDateTime(new Date(minTime).toISOString()))}</text>
+        <text x="${width - padding.right}" y="${height - 6}" text-anchor="end" class="obs-chart-axis">${escapeHtml(formatDateTime(new Date(maxTime).toISOString()))}</text>
+      </g>`
+    : '';
+
+  const lines = series.map((item, index) => {
+    const color = OBS_CHART_COLORS[index % OBS_CHART_COLORS.length];
+    const path = buildLinePath(item.points, projectX, projectY);
+    const dots = item.points.map(point =>
+      `<circle cx="${projectX(point.ts)}" cy="${projectY(point.value)}" r="3.5" fill="${color}">
+        <title>${escapeHtml(item.label)}: ${escapeHtml(String(point.value))}${item.unit ? ' ' + escapeHtml(item.unit) : ''} on ${escapeHtml(formatDateTime(point.at))}</title>
+      </circle>`
+    ).join('');
+    return `<g>
+      <path d="${path}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+      ${dots}
+    </g>`;
+  }).join('');
+
+  const legend = series.map((item, index) => {
+    const color = OBS_CHART_COLORS[index % OBS_CHART_COLORS.length];
+    const latestPoint = item.points[item.points.length - 1];
+    return `<span class="obs-legend-item">
+      <span class="obs-legend-swatch" style="background:${color}"></span>
+      <span>${escapeHtml(item.label)}${item.unit ? ` <span class="muted">(${escapeHtml(item.unit)})</span>` : ''}</span>
+      <strong>${escapeHtml(String(latestPoint.value))}</strong>
+    </span>`;
+  }).join('');
+
+  return `<div class="obs-chart-card">
+    <div class="obs-legend">${legend}</div>
+    <svg class="obs-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(group.label)} trend chart">
+      ${gridLines}
+      ${lines}
+      ${timeLabels}
+    </svg>
+  </div>`;
+}
+
+function renderObservationGroup(group) {
+  const latest = group.latest || {};
+  const timeline = group.entries.map(entry => {
+    const componentValue = Array.isArray(entry.components) && entry.components.length
+      ? entry.components.map(component => `${escapeHtml(component.display || component.code || 'Value')}: <strong>${escapeHtml(String(component.value ?? ''))}</strong>${component.unit ? ' <span class="muted">' + escapeHtml(component.unit) + '</span>' : ''}`).join(' / ')
+      : `<strong>${escapeHtml(entry.value || '—')}</strong>${entry.unit ? ' <span class="muted">' + escapeHtml(entry.unit) + '</span>' : ''}`;
+    return `<li>
+      <div class="obs-timeline-dot"></div>
+      <div class="obs-timeline-card">
+        <div class="obs-timeline-meta">${escapeHtml(entry.effectiveDateTime ? formatDateTime(entry.effectiveDateTime) : 'No effective date')}</div>
+        <div class="obs-timeline-value">${componentValue}</div>
+      </div>
+    </li>`;
+  }).join('');
+
+  return `<article class="obs-group-card">
+    <div class="obs-group-header">
+      <div>
+        <h4>${escapeHtml(group.label)}</h4>
+        <p>${group.entries.length} record${group.entries.length === 1 ? '' : 's'}${latest.effectiveDateTime ? ' · Latest ' + escapeHtml(formatDateTime(latest.effectiveDateTime)) : ''}</p>
+      </div>
+      ${group.code ? `<span class="id-chip">${escapeHtml(group.code)}</span>` : ''}
+    </div>
+    ${renderObservationChart(group)}
+    <ol class="obs-timeline">${timeline}</ol>
+  </article>`;
+}
+
+function renderObservationSection(observations, heading = 'Recent Observations') {
+  const rows = observations || [];
+  const grouped = groupObservations(rows);
+  const tableRows = rows.length
+    ? rows.map(o =>
+        `<tr>
+          <td>${escapeHtml(o.display || o.code)}</td>
+          <td><strong>${escapeHtml(o.value)}</strong>${o.unit ? ' <span class="muted">' + escapeHtml(o.unit) + '</span>' : ''}</td>
+          <td class="muted">${escapeHtml(o.effectiveDateTime ? formatDateTime(o.effectiveDateTime) : '')}</td>
+        </tr>`).join('')
+    : '<tr><td colspan="3" class="muted">None on record</td></tr>';
+
+  const groupedHtml = grouped.length
+    ? grouped.map(renderObservationGroup).join('')
+    : '<p class="muted">None on record</p>';
+
+  return `
+      <div class="obs-section-head">
+        <div>
+          <h3>${escapeHtml(heading)}</h3>
+          <p class="muted">Group repeated measurements into dated history and show trend lines when values are numeric.</p>
+        </div>
+        <div class="tabs obs-view-toggle" role="tablist" aria-label="Observation display options">
+          <button type="button" class="tab active obs-view-btn" data-view="grouped">Grouped history</button>
+          <button type="button" class="tab obs-view-btn" data-view="table">Table</button>
+        </div>
+      </div>
+      <div class="obs-panel" data-panel="grouped">${groupedHtml}</div>
+      <div class="obs-panel" data-panel="table" hidden>
+        <table><thead><tr><th>Observation</th><th>Value</th><th>Date</th></tr></thead><tbody>${tableRows}</tbody></table>
+      </div>`;
+}
+
+function wireObservationViewToggle(container) {
+  const buttons = container.querySelectorAll('.obs-view-btn');
+  const panels = container.querySelectorAll('.obs-panel');
+  buttons.forEach(button => {
+    button.addEventListener('click', () => {
+      const view = button.dataset.view;
+      buttons.forEach(item => item.classList.toggle('active', item === button));
+      panels.forEach(panel => {
+        panel.hidden = panel.dataset.panel !== view;
+      });
+    });
+  });
+}
+
+function wireConditionViewToggle(container) {
+  const buttons = container.querySelectorAll('.cond-view-btn');
+  const panels = container.querySelectorAll('.cond-panel');
+  buttons.forEach(button => {
+    button.addEventListener('click', () => {
+      const view = button.dataset.view;
+      buttons.forEach(item => item.classList.toggle('active', item === button));
+      panels.forEach(panel => {
+        panel.hidden = panel.dataset.panel !== view;
+      });
+    });
+  });
+}
+
+function renderIdentifiers(identifiers) {
+  if (!identifiers || !identifiers.length) return '<span class="muted">—</span>';
+  return identifiers
+    .filter(i => i.label !== 'MDM')   // hide internal MDM golden resource IDs by default
+    .map(i => `<span class="id-chip" title="${escapeHtml(i.system)}">${escapeHtml(i.label)}: ${escapeHtml(i.value)}</span>`)
+    .join(' ') || identifiers.map(i => `<span class="id-chip muted">${escapeHtml(i.value)}</span>`).join(' ');
+}
+
+function facilityChip(label) {
+  if (!label) return '<span class="muted">—</span>';
+  return `<span class="id-chip" title="Organization/${escapeHtml(label)}">Org ${escapeHtml(label)}</span>`;
+}
+
+function render(rows) {
+  const body = document.getElementById('patientBody');
+  if (!rows.length) { body.innerHTML = '<tr><td colspan="6" class="muted">No patients found.</td></tr>'; return; }
+  body.innerHTML = rows.map(p => `<tr>
+    <td><strong>${escapeHtml(p.name || '(unnamed)')}</strong></td>
+    <td>${escapeHtml(p.gender || '')}</td>
+    <td>${escapeHtml(p.birthDate ? formatDate(p.birthDate) : '')}</td>
+    <td>${renderIdentifiers(p.identifiers)}</td>
+    <td>${facilityChip(p.facility_label)}</td>
+    <td class="action-cell">
+      <button class="btn-secondary btn-sm" onclick="openPatientDetail('${escapeHtml(p.id)}')">View</button>
+      <a class="button btn-sm" href="/submit?patientId=${escapeHtml(p.id)}">➕ Refer</a>
+    </td></tr>`).join('');
+}
+
+async function search() {
+  const name = document.getElementById('qName').value.trim();
+  const id = document.getElementById('qId').value.trim();
+  const showAll = document.getElementById('chkAllFacilities').checked;
+  const params = [];
+  if (name) params.push('name=' + encodeURIComponent(name));
+  if (id) params.push('identifier=' + encodeURIComponent(id));
+  if (!showAll) {
+    const facility = window.PHEREF && window.PHEREF.getSelectedFacility ? window.PHEREF.getSelectedFacility() : null;
+    if (facility && (facility.org_id || facility.code)) {
+      params.push('organization_id=' + encodeURIComponent(facility.org_id || facility.code));
+    }
+  }
+  document.getElementById('patientBody').innerHTML = '<tr><td colspan="6" class="muted">Loading…</td></tr>';
+  try {
+    const data = await API.get('/api/patients' + (params.length ? '?' + params.join('&') : ''));
+    patients = data.patients || [];
+    render(patients);
+  } catch (e) {
+    document.getElementById('patientBody').innerHTML = '<tr><td colspan="6"><div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div></td></tr>';
+  }
+}
+
+async function openPatientDetail(id) {
+  const modal = document.getElementById('patientModal');
+  const body  = document.getElementById('modalBody');
+  const title = document.getElementById('modalTitle');
+  const btnRef = document.getElementById('btnModalReferral');
+  modal.style.display = 'flex';
+  body.innerHTML = '<p class="muted">Loading…</p>';
+  btnRef.style.display = 'none';
+  try {
+    const d = await API.get('/api/patients/' + id);
+    const p = d.summary;
+    title.textContent = p.name || 'Patient ' + id;
+    btnRef.href = '/submit?patientId=' + encodeURIComponent(id);
+    btnRef.style.display = '';
+
+    const idsHtml = (p.identifiers || []).map(i =>
+      `<tr><td>${escapeHtml(i.label)}</td><td>${escapeHtml(i.value)}</td><td class="muted">${escapeHtml(i.system)}</td></tr>`
+    ).join('') || '<tr><td colspan="3" class="muted">None</td></tr>';
+
+    const refHtml = (d.referrals || []).map(r =>
+      `<tr><td>${escapeHtml(formatDateTime(r.authoredOn))}</td>
+       <td><span class="badge ${escapeHtml(r.status)}">${escapeHtml(r.status)}</span></td>
+       <td class="muted">${escapeHtml(r.focus || '')}</td></tr>`
+    ).join('') || '<tr><td colspan="3" class="muted">No referrals found</td></tr>';
+
+    body.innerHTML = `
+      <dl class="kv">
+        <dt>Full name</dt><dd>${escapeHtml(p.name || '—')}</dd>
+        <dt>Sex</dt><dd>${escapeHtml(p.gender || '—')}</dd>
+        <dt>Birth date</dt><dd>${escapeHtml(p.birthDate ? formatDate(p.birthDate) : '—')}</dd>
+        <dt>Address</dt><dd>${escapeHtml(p.address || '—')}</dd>
+        ${(p.telecom||[]).map(t=>`<dt>${escapeHtml(t.system||'contact')}</dt><dd>${escapeHtml(t.value||'')}</dd>`).join('')}
+      </dl>
+      <h3>Identifiers</h3>
+      <table><thead><tr><th>Type</th><th>Value</th><th>System</th></tr></thead><tbody>${idsHtml}</tbody></table>
+      ${renderConditionSection(d.conditions || [], { heading: 'Active Conditions', emptyText: 'None on record' })}
+      ${renderObservationSection(d.observations || [])}
+      <h3>Referral History</h3>
+      <table><thead><tr><th>Authored</th><th>Status</th><th>Service Request</th></tr></thead><tbody>${refHtml}</tbody></table>`;
+    wireConditionViewToggle(body);
+    wireObservationViewToggle(body);
+  } catch (e) {
+    body.innerHTML = '<div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div>';
+  }
+}
+
+function closeModal() {
+  document.getElementById('patientModal').style.display = 'none';
+}
+
+document.getElementById('btnSearch').addEventListener('click', search);
+document.getElementById('btnCloseModal').addEventListener('click', closeModal);
+document.getElementById('btnCloseModal2').addEventListener('click', closeModal);
+document.getElementById('patientModal').addEventListener('click', e => { if (e.target === e.currentTarget) closeModal(); });
+document.querySelectorAll('th[data-k]').forEach(th => th.addEventListener('click', () => {
+  const k = th.dataset.k;
+  patients.sort((a, b) => String(a[k] || '').localeCompare(String(b[k] || '')));
+  render(patients);
+}));
+window.addEventListener('pheref:facility-change', () => search());
+search();
+</script>
+{% endblock %}

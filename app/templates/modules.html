@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p class="muted">
+    Granular module console. The eReferral is always submitted as one transaction
+    <strong>Bundle</strong>, but every underlying FHIR operation from the PH eReferral
+    Postman collection is exposed here individually so you can inspect its method &amp;
+    URL, preview the exact JSON, hover any field for its FHIR meaning, fetch the existing
+    server copy of a master record (GET), or upsert a single master resource.
+  </p>
+  <div class="btn-row">
+    <button id="btnLoadForm" class="btn-secondary" title="Load the form you last previewed/submitted on the Submit page.">Load last form</button>
+    <button id="btnLoadSample" class="btn-ghost" title="Seed with the IG Ana Reyes demo data (DEFAULTS). For testing only — never a production fallback.">Load sample (Ana Reyes)</button>
+    <a href="/submit" class="btn-ghost" style="text-decoration:none">Back to Submit form</a>
+  </div>
+  <p class="muted" id="moduleSource" style="margin-top:8px">No form loaded yet.</p>
+</div>
+
+<div class="card" id="bundleCard">
+  <h2>Full eReferral Bundle <span class="muted">(canonical submission)</span></h2>
+  <p class="muted">POST <code>{baseUrl}</code> · transaction Bundle of all modules below. This is the supported way to submit a referral.</p>
+  <div class="btn-row">
+    <button id="btnBundlePreview" class="btn-secondary">Preview Bundle JSON</button>
+    <button id="btnBundleSubmit">Submit Bundle</button>
+  </div>
+  <div class="json-viewer" id="bundleJson" style="display:none"></div>
+  <div id="bundleResult"></div>
+</div>
+
+<h2 class="page-subtitle">Master resources <span class="muted">(idempotent conditional PUT upsert)</span></h2>
+<div id="masterModules" class="module-grid"></div>
+
+<h2 class="page-subtitle">Clinical resources <span class="muted">(POST create — submit via Bundle)</span></h2>
+<div id="clinicalModules" class="module-grid"></div>
+
+<div id="fieldTooltip" class="field-tooltip" style="display:none"></div>
+
+<script src="/static/js/modules.js?v=20260625a"></script>
+{% endblock %}

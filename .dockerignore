@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+config/runtime-config.json
+.pytest_cache/
+.git/
+tests/
+*.md

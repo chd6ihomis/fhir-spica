@@ -1,0 +1,501 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p class="muted">Referral worklist for the receiving facility — Tasks retrieved from the FHIR server.
+  Filter by workflow status and advance referrals through the state machine
+  (requested → received → accepted → completed; or rejected).</p>
+  <div class="field-row">
+    <div><label>Status</label>
+      <select id="qStatus">
+        <option value="">All</option>
+        <option value="requested">Requested</option>
+        <option value="received">Received</option>
+        <option value="accepted">Accepted</option>
+        <option value="completed">Completed</option>
+        <option value="rejected">Diverted</option>
+      </select>
+    </div>
+    <div><label>Owner (PractitionerRole/ID)</label><input id="qOwner" placeholder="optional"></div>
+    <div class="worklist-filter-actions">
+      <label class="worklist-filter-toggle">
+        <input type="checkbox" id="chkAllFacilities"> Show all facilities
+      </label>
+      <button id="btnLoad">Load</button>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <table id="taskTable">
+    <thead><tr>
+      <th data-k="patientName">Patient</th>
+      <th data-k="authoredOn">Authored</th>
+      <th data-k="status">Status</th>
+      <th data-k="priority">Priority</th>
+      <th>Referral / SR</th>
+      <th>Referring</th>
+      <th>Receiving</th>
+      <th>Note</th>
+      <th>Actions</th>
+    </tr></thead>
+    <tbody id="taskBody"><tr><td colspan="9" class="muted">Loading…</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card" id="detailCard" style="display:none">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <h2>Referral detail</h2>
+    <button class="btn-ghost" onclick="document.getElementById('detailCard').style.display='none'">✕ Close</button>
+  </div>
+  <div id="detailBody"></div>
+  <details style="margin-top:1rem">
+    <summary class="muted">Raw FHIR JSON</summary>
+    <div class="json-viewer" id="detailJson"></div>
+  </details>
+</div>
+
+<script>
+let tasks = [];
+const NEXT = { requested: 'Received', received: 'Accepted', accepted: 'Completed', rejected: 'Diverted'  };
+const OBS_CHART_COLORS = ['#0c6e29', '#2563eb', '#b45309', '#b91c1c'];
+
+function formatStatusLabel(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '—';
+  const display = normalized === 'rejected' ? 'diverted' : normalized;
+  return display.charAt(0).toUpperCase() + display.slice(1);
+}
+
+function badge(v, cls) {
+  return `<span class="badge ${escapeHtml(cls || v || '')}">${escapeHtml(formatStatusLabel(v))}</span>`;
+}
+
+function srLabel(ref) {
+  if (!ref) return '—';
+  // e.g. "ServiceRequest/16420" → show just the numeric ID with a label
+  const parts = ref.split('/');
+  if (parts.length === 2) return `<span class="muted" title="${escapeHtml(ref)}">${escapeHtml(parts[0])} #${escapeHtml(parts[1])}</span>`;
+  return escapeHtml(ref);
+}
+
+function observationGroupKey(obs) {
+  return [obs.system || '', obs.code || '', obs.display || obs.value || 'Observation'].join('|');
+}
+
+function observationLabel(obs) {
+  return obs.display || obs.code || 'Observation';
+}
+
+function observationTimestamp(iso) {
+  if (!iso) return 0;
+  const ts = Date.parse(iso);
+  return Number.isNaN(ts) ? 0 : ts;
+}
+
+function groupObservations(observations) {
+  const groups = new Map();
+  [...(observations || [])]
+    .sort((a, b) => observationTimestamp(b.effectiveDateTime) - observationTimestamp(a.effectiveDateTime))
+    .forEach(obs => {
+      const key = observationGroupKey(obs);
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          code: obs.code || '',
+          system: obs.system || '',
+          label: observationLabel(obs),
+          entries: [],
+        });
+      }
+      groups.get(key).entries.push(obs);
+    });
+
+  return [...groups.values()].map(group => {
+    const seriesMap = new Map();
+    group.entries.forEach(entry => {
+      if (Array.isArray(entry.components) && entry.components.length) {
+        entry.components.forEach(component => {
+          if (typeof component.value !== 'number') return;
+          const seriesKey = component.code || component.display;
+          if (!seriesMap.has(seriesKey)) {
+            seriesMap.set(seriesKey, {
+              key: seriesKey,
+              label: component.display || component.code || 'Value',
+              unit: component.unit || '',
+              points: [],
+            });
+          }
+          seriesMap.get(seriesKey).points.push({
+            at: entry.effectiveDateTime || '',
+            ts: observationTimestamp(entry.effectiveDateTime),
+            value: component.value,
+          });
+        });
+        return;
+      }
+
+      if (typeof entry.numericValue === 'number') {
+        const seriesKey = group.code || group.label;
+        if (!seriesMap.has(seriesKey)) {
+          seriesMap.set(seriesKey, {
+            key: seriesKey,
+            label: group.label,
+            unit: entry.unit || '',
+            points: [],
+          });
+        }
+        seriesMap.get(seriesKey).points.push({
+          at: entry.effectiveDateTime || '',
+          ts: observationTimestamp(entry.effectiveDateTime),
+          value: entry.numericValue,
+        });
+      }
+    });
+
+    const series = [...seriesMap.values()]
+      .map(item => ({ ...item, points: item.points.sort((a, b) => a.ts - b.ts) }))
+      .filter(item => item.points.length);
+
+    return { ...group, series, latest: group.entries[0] || null };
+  }).sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function buildLinePath(points, projectX, projectY) {
+  return points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${projectX(point.ts)} ${projectY(point.value)}`).join(' ');
+}
+
+function renderObservationChart(group) {
+  const series = group.series || [];
+  if (!series.length) return '';
+
+  const allPoints = series.flatMap(item => item.points);
+  const width = 640;
+  const height = 180;
+  const padding = { top: 16, right: 18, bottom: 28, left: 42 };
+  const values = allPoints.map(point => point.value);
+  const times = allPoints.map(point => point.ts).filter(Boolean);
+  let minValue = Math.min(...values);
+  let maxValue = Math.max(...values);
+  if (minValue === maxValue) {
+    minValue -= 1;
+    maxValue += 1;
+  }
+  const minTime = times.length ? Math.min(...times) : 0;
+  const maxTime = times.length ? Math.max(...times) : minTime;
+  const innerWidth = width - padding.left - padding.right;
+  const innerHeight = height - padding.top - padding.bottom;
+
+  const projectX = ts => {
+    if (!times.length || minTime === maxTime) return padding.left + innerWidth / 2;
+    return padding.left + ((ts - minTime) / (maxTime - minTime)) * innerWidth;
+  };
+  const projectY = value => padding.top + (maxValue - value) / (maxValue - minValue) * innerHeight;
+
+  const gridLines = [0, 0.5, 1].map(step => {
+    const value = maxValue - (maxValue - minValue) * step;
+    const y = padding.top + innerHeight * step;
+    return `<g>
+      <line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" stroke="#dbe4ee" stroke-dasharray="4 4"></line>
+      <text x="${padding.left - 8}" y="${y + 4}" text-anchor="end" class="obs-chart-axis">${escapeHtml(value.toFixed(1).replace(/\.0$/, ''))}</text>
+    </g>`;
+  }).join('');
+
+  const timeLabels = times.length
+    ? `<g>
+        <text x="${padding.left}" y="${height - 6}" text-anchor="start" class="obs-chart-axis">${escapeHtml(formatDateTime(new Date(minTime).toISOString()))}</text>
+        <text x="${width - padding.right}" y="${height - 6}" text-anchor="end" class="obs-chart-axis">${escapeHtml(formatDateTime(new Date(maxTime).toISOString()))}</text>
+      </g>`
+    : '';
+
+  const lines = series.map((item, index) => {
+    const color = OBS_CHART_COLORS[index % OBS_CHART_COLORS.length];
+    const path = buildLinePath(item.points, projectX, projectY);
+    const dots = item.points.map(point =>
+      `<circle cx="${projectX(point.ts)}" cy="${projectY(point.value)}" r="3.5" fill="${color}">
+        <title>${escapeHtml(item.label)}: ${escapeHtml(String(point.value))}${item.unit ? ' ' + escapeHtml(item.unit) : ''} on ${escapeHtml(formatDateTime(point.at))}</title>
+      </circle>`
+    ).join('');
+    return `<g>
+      <path d="${path}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+      ${dots}
+    </g>`;
+  }).join('');
+
+  const legend = series.map((item, index) => {
+    const color = OBS_CHART_COLORS[index % OBS_CHART_COLORS.length];
+    const latestPoint = item.points[item.points.length - 1];
+    return `<span class="obs-legend-item">
+      <span class="obs-legend-swatch" style="background:${color}"></span>
+      <span>${escapeHtml(item.label)}${item.unit ? ` <span class="muted">(${escapeHtml(item.unit)})</span>` : ''}</span>
+      <strong>${escapeHtml(String(latestPoint.value))}</strong>
+    </span>`;
+  }).join('');
+
+  return `<div class="obs-chart-card">
+    <div class="obs-legend">${legend}</div>
+    <svg class="obs-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(group.label)} trend chart">
+      ${gridLines}
+      ${lines}
+      ${timeLabels}
+    </svg>
+  </div>`;
+}
+
+function renderObservationGroup(group) {
+  const latest = group.latest || {};
+  const timeline = group.entries.map(entry => {
+    const componentValue = Array.isArray(entry.components) && entry.components.length
+      ? entry.components.map(component => `${escapeHtml(component.display || component.code || 'Value')}: <strong>${escapeHtml(String(component.value ?? ''))}</strong>${component.unit ? ' <span class="muted">' + escapeHtml(component.unit) + '</span>' : ''}`).join(' / ')
+      : `<strong>${escapeHtml(entry.value || '—')}</strong>${entry.unit ? ' <span class="muted">' + escapeHtml(entry.unit) + '</span>' : ''}`;
+    return `<li>
+      <div class="obs-timeline-dot"></div>
+      <div class="obs-timeline-card">
+        <div class="obs-timeline-meta">${escapeHtml(entry.effectiveDateTime ? formatDateTime(entry.effectiveDateTime) : 'No effective date')}</div>
+        <div class="obs-timeline-value">${componentValue}</div>
+      </div>
+    </li>`;
+  }).join('');
+
+  return `<article class="obs-group-card">
+    <div class="obs-group-header">
+      <div>
+        <h4>${escapeHtml(group.label)}</h4>
+        <p>${group.entries.length} record${group.entries.length === 1 ? '' : 's'}${latest.effectiveDateTime ? ' · Latest ' + escapeHtml(formatDateTime(latest.effectiveDateTime)) : ''}</p>
+      </div>
+      ${group.code ? `<span class="id-chip">${escapeHtml(group.code)}</span>` : ''}
+    </div>
+    ${renderObservationChart(group)}
+    <ol class="obs-timeline">${timeline}</ol>
+  </article>`;
+}
+
+function renderObservationSection(observations) {
+  const rows = observations || [];
+  const grouped = groupObservations(rows);
+  const tableRows = rows.length
+    ? rows.map(o =>
+        `<tr>
+          <td>${escapeHtml(o.display || o.code)}</td>
+          <td><strong>${escapeHtml(o.value)}</strong>${o.unit ? ' <span class="muted">' + escapeHtml(o.unit) + '</span>' : ''}</td>
+          <td class="muted">${escapeHtml(o.effectiveDateTime ? formatDateTime(o.effectiveDateTime) : '')}</td>
+        </tr>`).join('')
+    : '<tr><td colspan="3" class="muted">No observations recorded</td></tr>';
+
+  const groupedHtml = grouped.length
+    ? grouped.map(renderObservationGroup).join('')
+    : '<p class="muted">No observations recorded</p>';
+
+  return `<section>
+    <div class="obs-section-head">
+      <div>
+        <h3>Observations / Vitals</h3>
+        <p class="muted">Group repeated measurements into dated history and show trend lines when values are numeric.</p>
+      </div>
+      <div class="tabs obs-view-toggle" role="tablist" aria-label="Observation display options">
+        <button type="button" class="tab active obs-view-btn" data-view="grouped">Grouped history</button>
+        <button type="button" class="tab obs-view-btn" data-view="table">Table</button>
+      </div>
+    </div>
+    <div class="obs-panel" data-panel="grouped">${groupedHtml}</div>
+    <div class="obs-panel" data-panel="table" hidden>
+      <table>
+        <thead><tr><th>Observation</th><th>Value</th><th>Date</th></tr></thead>
+        <tbody>${tableRows}</tbody>
+      </table>
+    </div>
+  </section>`;
+}
+
+function wireObservationViewToggle(container) {
+  const buttons = container.querySelectorAll('.obs-view-btn');
+  const panels = container.querySelectorAll('.obs-panel');
+  buttons.forEach(button => {
+    button.addEventListener('click', () => {
+      const view = button.dataset.view;
+      buttons.forEach(item => item.classList.toggle('active', item === button));
+      panels.forEach(panel => {
+        panel.hidden = panel.dataset.panel !== view;
+      });
+    });
+  });
+}
+
+function wireConditionViewToggle(container) {
+  const buttons = container.querySelectorAll('.cond-view-btn');
+  const panels = container.querySelectorAll('.cond-panel');
+  buttons.forEach(button => {
+    button.addEventListener('click', () => {
+      const view = button.dataset.view;
+      buttons.forEach(item => item.classList.toggle('active', item === button));
+      panels.forEach(panel => {
+        panel.hidden = panel.dataset.panel !== view;
+      });
+    });
+  });
+}
+
+function orgChip(orgId) {
+  if (!orgId) return '<span class="muted">—</span>';
+  return `<span class="id-chip" title="Organization/${escapeHtml(orgId)}">Org ${escapeHtml(orgId)}</span>`;
+}
+
+function orgDisplay(practitionerName, orgId, orgName) {
+  // practitionerName comes from PractitionerRole-typed reference display
+  // (the practitioner). orgName is the facility resolved via the
+  // PractitionerRole.organization chain in the API layer.
+  const parts = [];
+  if (practitionerName) parts.push(`<span>${escapeHtml(practitionerName)}</span>`);
+  if (orgName) parts.push(`<span class="muted">@ ${escapeHtml(orgName)}</span>`);
+  if (orgId) parts.push(`<span class="id-chip">Org ${escapeHtml(orgId)}</span>`);
+  if (!parts.length) return '<span class="muted">—</span>';
+  return parts.join(' ');
+}
+
+function render(rows) {
+  const body = document.getElementById('taskBody');
+  if (!rows.length) { body.innerHTML = '<tr><td colspan="9" class="muted">No referrals.</td></tr>'; return; }
+  body.innerHTML = rows.map(t => {
+    const next = NEXT[t.status];
+    let actions = `<button class="btn-secondary btn-sm" onclick="openDetail('${escapeHtml(t.id)}')">View</button> `;
+    if (next) actions += `<button class="btn-sm" onclick="advance('${escapeHtml(t.id)}','${next}')">→ ${next}</button> `;
+    if (t.status === 'requested' || t.status === 'received')
+      actions += `<button class="btn-ghost btn-sm" onclick="advance('${escapeHtml(t.id)}','rejected')">Diverted</button>`;
+    return `<tr>
+      <td>${t.patientName ? escapeHtml(t.patientName) : '<span class="muted">' + escapeHtml(t.for || '—') + '</span>'}</td>
+      <td>${escapeHtml(formatDateTime(t.authoredOn))}</td>
+      <td>${badge(t.status)}</td>
+      <td>${badge(t.priority || 'routine', t.priority === 'urgent' ? 'urgent' : '')}</td>
+      <td>${srLabel(t.focus)}</td>
+      <td>${orgDisplay(t.requester_display, t.requester_org, t.requester_org_name)}</td>
+      <td>${orgDisplay(t.owner_display, t.performer_org, t.performer_org_name)}</td>
+      <td class="muted">${escapeHtml(t.note || '')}</td>
+      <td>${actions}</td></tr>`;
+  }).join('');
+}
+
+async function load() {
+  const status = document.getElementById('qStatus').value;
+  const owner = document.getElementById('qOwner').value.trim();
+  const showAll = document.getElementById('chkAllFacilities').checked;
+  const params = ['count=100'];
+  if (status) params.push('status=' + status);
+  if (owner) params.push('owner=' + encodeURIComponent(owner));
+  if (!showAll) {
+    const facility = window.PHEREF && window.PHEREF.getSelectedFacility ? window.PHEREF.getSelectedFacility() : null;
+    if (facility && (facility.org_id || facility.code)) {
+      params.push('organization_id=' + encodeURIComponent(facility.org_id || facility.code));
+    }
+  }
+  document.getElementById('taskBody').innerHTML = '<tr><td colspan="9" class="muted">Loading…</td></tr>';
+  try {
+    const data = await API.get('/api/referrals?' + params.join('&'));
+    tasks = data.referrals || [];
+    render(tasks);
+  } catch (e) {
+    document.getElementById('taskBody').innerHTML = '<tr><td colspan="9"><div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div></td></tr>';
+  }
+}
+
+async function advance(id, status) {
+  const note = prompt('Note for transition to "' + status + '":', '');
+  if (note === null) return;
+  try {
+    const r = await API.send('POST', '/api/referrals/' + id + '/status', { status, note });
+    toast('Updated via ' + r.method + ' → ' + status, 'ok');
+    load();
+  } catch (e) { toast(fhirErrorMessage(e), 'err'); }
+}
+
+async function openDetail(id) {
+  const card = document.getElementById('detailCard');
+  card.style.display = '';
+  document.getElementById('detailBody').innerHTML = '<p class="muted">Loading…</p>';
+  card.scrollIntoView({ behavior: 'smooth' });
+  try {
+    const d = await API.get('/api/referrals/' + id);
+    const p = d.patientSummary || {};
+    const sr = d.serviceRequest || {};
+    const task = d.task || {};
+
+    // --- Patient summary ---
+    const idsHtml = (p.identifiers || [])
+      .filter(i => i.label !== 'MDM')
+      .map(i => `<span class="id-chip" title="${escapeHtml(i.system)}">${escapeHtml(i.label)}: ${escapeHtml(i.value)}</span>`)
+      .join(' ') || '<span class="muted">—</span>';
+
+    // --- Referral (ServiceRequest) details ---
+    const reasonCoding = (((sr.reasonCode || [])[0] || {}).coding || [])[0] || {};
+    const categoryCoding = (((sr.category || [])[0] || {}).coding || [])[0] || {};
+    const srReason = reasonCoding.display || reasonCoding.code
+      || ((sr.reasonCode || [])[0] || {}).text || '—';
+    const srCategory = categoryCoding.display || categoryCoding.code
+      || ((sr.category || [])[0] || {}).text || '—';
+    const taskNote = ((task.note || [])[0] || {}).text || '';
+    const srNote = ((sr.note || [])[0] || {}).text || taskNote || '—';
+    const authoredOn = formatDateTime(task.authoredOn);
+    const timeCalled = task.authoredOn ? formatDateTime(task.authoredOn, true) : '—';
+    const requesterRef = sr.requester || task.requester || {};
+    const requesterOrgName = requesterRef.display || '—';
+    const requesterOrgId = String(requesterRef.reference || '').startsWith('Organization/')
+      ? String(requesterRef.reference || '').split('/')[1] || ''
+      : '';
+    const performerRef = ((sr.performer || [])[0]) || (task.owner || {});
+    const ownerOrgName = performerRef.display || '—';
+    const ownerOrgId = String(performerRef.reference || '').startsWith('Organization/')
+      ? String(performerRef.reference || '').split('/')[1] || ''
+      : '';
+    const addressParts = [];
+    if (p.patient_line) addressParts.push(p.patient_line);
+    if (p.barangay_code) addressParts.push(`Barangay ${p.barangay_code}`);
+    if (p.city_code) addressParts.push(`City/Municipality ${p.city_code}`);
+    if (p.province_code) addressParts.push(`Province ${p.province_code}`);
+    if (p.region_code) addressParts.push(`Region ${p.region_code}`);
+    if (p.patient_postal) addressParts.push(p.patient_postal);
+    const patientAddress = addressParts.length ? addressParts.join(', ') : (p.address || '—');
+
+    document.getElementById('detailBody').innerHTML = `
+      <section>
+        <h3>Patient</h3>
+        <dl class="kv">
+          <dt>Name</dt><dd>${escapeHtml(p.name || '—')}</dd>
+          <dt>Sex</dt><dd>${escapeHtml(p.gender || '—')}</dd>
+          <dt>Birth date</dt><dd>${escapeHtml(p.birthDate ? formatDate(p.birthDate) : '—')}</dd>
+          <dt>Address</dt><dd>${escapeHtml(patientAddress)}</dd>
+          <dt>Identifiers</dt><dd>${idsHtml}</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Referral</h3>
+        <dl class="kv">
+          <dt>Task status</dt><dd>${badge(task.status)}</dd>
+          <dt>Priority</dt><dd>${badge(sr.priority || task.priority || 'routine')}</dd>
+          <dt>Category</dt><dd>${escapeHtml(srCategory)}</dd>
+          <dt>Reason for referral</dt><dd>${escapeHtml(srReason)}</dd>
+          <dt>Referring organization</dt><dd>${escapeHtml(requesterOrgName)}${requesterOrgId ? ` <span class="id-chip">Org ${escapeHtml(requesterOrgId)}</span>` : ''}</dd>
+          <dt>Receiving organization</dt><dd>${escapeHtml(ownerOrgName)}${ownerOrgId ? ` <span class="id-chip">Org ${escapeHtml(ownerOrgId)}</span>` : ''}</dd>
+          <dt>Date of referral / authored</dt><dd>${escapeHtml(authoredOn)}</dd>
+          <dt>Time called</dt><dd>${escapeHtml(timeCalled)}</dd>
+          <dt>Last modified</dt><dd>${escapeHtml(task.lastModified ? formatDateTime(task.lastModified) : '—')}</dd>
+          <dt>Note</dt><dd>${escapeHtml(srNote)}</dd>
+        </dl>
+      </section>
+      ${renderConditionSection(d.conditions || [], { heading: 'Conditions / Diagnoses', emptyText: 'No conditions recorded' })}
+      ${renderObservationSection(d.observations || [])}`;
+    wireConditionViewToggle(document.getElementById('detailBody'));
+    wireObservationViewToggle(document.getElementById('detailBody'));
+    document.getElementById('detailJson').textContent = JSON.stringify(d, null, 2);
+  } catch (e) {
+    document.getElementById('detailBody').innerHTML = '<div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div>';
+  }
+}
+
+document.getElementById('btnLoad').addEventListener('click', load);
+document.querySelectorAll('th[data-k]').forEach(th => th.addEventListener('click', () => {
+  const k = th.dataset.k;
+  tasks.sort((a, b) => String(a[k] || '').localeCompare(String(b[k] || '')));
+  render(tasks);
+}));
+window.addEventListener('pheref:facility-change', () => load());
+load();
+</script>
+{% endblock %}

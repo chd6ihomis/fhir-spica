@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }} · PHeRef Portal</title>
+  <link rel="stylesheet" href="/static/css/styles.css?v=20260625b" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand-mark" src="/static/img/logo.png" alt="Department of Health seal" />
+      <div class="brand-text">
+        <span class="logo">Project SPICA</span>
+        <span class="subtitle">Health Information Exchange</span>
+      </div>
+    </div>
+    <div class="facility-identity">
+      <label for="topbarFacilitySelect">Acting as (referring facility)</label>
+      <div class="facility-filter-row">
+        <select id="topbarProvinceSelect" title="Filter facilities by province">
+          <option value="">All provinces</option>
+        </select>
+        <select id="topbarCitySelect" title="Filter facilities by city/municipality">
+          <option value="">All cities/municipalities</option>
+        </select>
+      </div>
+      <select id="topbarFacilitySelect" title="Select your facility identity for referral demos">
+        <option value="">Loading facilities...</option>
+      </select>
+    </div>
+    <div class="server-pill" id="serverPill" title="Active FHIR transactional server">
+      <span class="dot" id="serverDot"></span>
+      <span id="serverLabel">{{ config.fhir_base_url }}</span>
+    </div>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      {% for path, label in nav %}
+        <a href="{{ path }}" class="nav-link {% if path == request.url.path %}active{% endif %}">{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <main class="content">
+      <!-- app.js must load before page inline scripts so API, toast, etc. are defined. -->
+      <script src="/static/js/app.js?v=20260624f"></script>
+      <h1 class="page-title">{{ title }}</h1>
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  <div id="toast" class="toast"></div>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

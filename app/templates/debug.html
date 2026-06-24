@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p class="muted">Developer debugging suite: inspect every FHIR / PSA API interaction
+  (headers, timing, body), view raw JSON payloads, and parse OperationOutcome errors
+  into actionable messages.</p>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="logs">API Log</div>
+  <div class="tab" data-tab="parser">OperationOutcome Parser</div>
+  <div class="tab" data-tab="lookup">Code Lookup</div>
+</div>
+
+<div id="tab-logs">
+  <div class="card">
+    <div class="btn-row">
+      <button id="btnRefresh" class="btn-secondary">Refresh</button>
+      <button id="btnClear" class="btn-ghost">Clear log</button>
+    </div>
+    <table>
+      <thead><tr><th>#</th><th>Time</th><th>Target</th><th>Method</th><th>URL</th><th>Status</th><th>ms</th></tr></thead>
+      <tbody id="logBody"><tr><td colspan="7" class="muted">No interactions yet.</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card" id="logDetailCard" style="display:none">
+    <h2>Interaction detail</h2>
+    <div class="json-viewer" id="logDetail"></div>
+  </div>
+</div>
+
+<div id="tab-parser" style="display:none">
+  <div class="card">
+    <label>Paste an OperationOutcome or transaction-response Bundle</label>
+    <textarea id="ooInput" style="min-height:160px" placeholder='{"resourceType":"OperationOutcome", ...}'></textarea>
+    <div class="btn-row"><button id="btnParse">Parse</button></div>
+    <div id="ooResult"></div>
+  </div>
+</div>
+
+<div id="tab-lookup" style="display:none">
+  <div class="card">
+    <div class="field-row">
+      <div><label>System</label><input id="luSystem" value="http://snomed.info/sct"></div>
+      <div><label>Code</label><input id="luCode" value="398254007"></div>
+      <div style="align-self:end"><button id="btnLookup">Lookup</button></div>
+    </div>
+    <div class="json-viewer" id="luResult" style="display:none"></div>
+  </div>
+</div>
+
+<script>
+document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  tab.classList.add('active');
+  ['logs','parser','lookup'].forEach(name => {
+    document.getElementById('tab-' + name).style.display = (name === tab.dataset.tab) ? '' : 'none';
+  });
+}));
+
+async function loadLogs() {
+  const body = document.getElementById('logBody');
+  try {
+    const data = await API.get('/api/logs?limit=100');
+    const rows = data.entries || [];
+    if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="muted">No interactions yet.</td></tr>'; return; }
+    body.innerHTML = rows.map(e => {
+      const status = e.error ? 'ERR' : (e.status_code != null ? e.status_code : '-');
+      const cls = e.ok ? '' : 'style="color:var(--err)"';
+      return `<tr ${cls} onclick="showLog(${e.id})" style="cursor:pointer">
+        <td>${e.id}</td><td>${escapeHtml(e.timestamp.replace('T',' ').slice(0,19))}</td>
+        <td>${escapeHtml(e.target)}</td><td>${escapeHtml(e.method)}</td>
+        <td class="muted" style="max-width:340px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(e.url)}</td>
+        <td>${escapeHtml(String(status))}</td><td>${e.duration_ms != null ? e.duration_ms : ''}</td></tr>`;
+    }).join('');
+  } catch (e) { body.innerHTML = '<tr><td colspan="7"><div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div></td></tr>'; }
+}
+async function showLog(id) {
+  const card = document.getElementById('logDetailCard');
+  card.style.display = '';
+  try {
+    const e = await API.get('/api/logs/' + id);
+    document.getElementById('logDetail').textContent = JSON.stringify(e, null, 2);
+    card.scrollIntoView({ behavior: 'smooth' });
+  } catch (err) { toast(fhirErrorMessage(err), 'err'); }
+}
+document.getElementById('btnRefresh').addEventListener('click', loadLogs);
+document.getElementById('btnClear').addEventListener('click', async () => {
+  await API.del('/api/logs'); loadLogs(); document.getElementById('logDetailCard').style.display = 'none';
+});
+
+document.getElementById('btnParse').addEventListener('click', async () => {
+  const box = document.getElementById('ooResult');
+  let parsed;
+  try { parsed = JSON.parse(document.getElementById('ooInput').value); }
+  catch (e) { box.innerHTML = '<div class="issue">Invalid JSON: ' + escapeHtml(e.message) + '</div>'; return; }
+  try {
+    const r = await API.send('POST', '/api/outcome/parse', parsed);
+    box.innerHTML = r.issues.length
+      ? `<p class="muted">${r.has_errors ? 'Errors found.' : 'No errors (warnings/info only).'}</p>` + renderIssues(r)
+      : '<div class="issue information">No issues found.</div>';
+  } catch (e) { box.innerHTML = '<div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div>'; }
+});
+
+document.getElementById('btnLookup').addEventListener('click', async () => {
+  const system = document.getElementById('luSystem').value;
+  const code = document.getElementById('luCode').value;
+  const out = document.getElementById('luResult');
+  out.style.display = ''; out.textContent = 'Looking up…';
+  try {
+    const r = await API.get('/api/terminology/lookup?system=' + encodeURIComponent(system) + '&code=' + encodeURIComponent(code));
+    out.textContent = JSON.stringify(r, null, 2);
+  } catch (e) { out.textContent = fhirErrorMessage(e); }
+});
+
+loadLogs();
+</script>
+{% endblock %}

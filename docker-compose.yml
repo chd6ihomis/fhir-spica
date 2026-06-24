@@ -1,0 +1,20 @@
+services:
+  pheref-portal:
+    build: .
+    image: pheref-portal:latest
+    container_name: pheref-portal
+    ports:
+      - "8000:8000"
+    environment:
+      # Override any setting here, or use the in-app Admin portal.
+      PHEREF_FHIR_BASE_URL: ${PHEREF_FHIR_BASE_URL:-https://cdr.pheref.fhirlab.net/fhir}
+      PHEREF_TERMINOLOGY_BASE_URL: ${PHEREF_TERMINOLOGY_BASE_URL:-https://tx.fhirlab.net/fhir}
+      PHEREF_PSA_BASE_URL: ${PHEREF_PSA_BASE_URL:-https://classification.psa.gov.ph}
+      PHEREF_PSA_VERSION: ${PHEREF_PSA_VERSION:-Q2_2024}
+      PHEREF_PSA_TOKEN: ${PHEREF_PSA_TOKEN:-}
+      PHEREF_FHIR_AUTH_TOKEN: ${PHEREF_FHIR_AUTH_TOKEN:-}
+      PHEREF_HTTP_TIMEOUT: ${PHEREF_HTTP_TIMEOUT:-30}
+    volumes:
+      # Persist runtime configuration written by the Admin portal.
+      - ./config:/app/config
+    restart: unless-stopped

@@ -1,0 +1,167 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p class="muted">Configure the environment without redeploying. Changes are saved to
+  <code>config/runtime-config.json</code> and applied immediately. Secrets are write-only —
+  leave them blank to keep the current value.</p>
+</div>
+
+<form id="configForm">
+
+  <fieldset class="card">
+    <legend>FHIR Servers</legend>
+    <div class="field-row">
+      <div><label>FHIR Transactional Server URL</label><input name="fhir_base_url"></div>
+      <div><label>Terminology Server URL</label><input name="terminology_base_url"></div>
+    </div>
+    <div>
+      <label>FHIR Authentication Token (Bearer)
+        <span class="hint" id="fhirTokenHint"></span>
+      </label>
+      <input name="fhir_auth_token" type="password" placeholder="leave blank to keep current value">
+    </div>
+  </fieldset>
+
+  <fieldset class="card">
+    <legend>PSA Classification API</legend>
+    <p class="muted">
+      Base URL for all PSA classification services (<code>https://classification.psa.gov.ph</code>).
+      PSGC and PSOC share the same base URL and token but use different version paths.
+    </p>
+    <div>
+      <label>PSA Base URL</label>
+      <input name="psa_base_url">
+    </div>
+
+    <div class="field-row" style="margin-top:1rem">
+      <div>
+        <label>PSGC Version
+          <span class="hint">Used for address hierarchy (regions / provinces / municipalities / barangays)</span>
+        </label>
+        <select name="psa_version" id="selPsgcVersion">
+          <option value="Q4_2025">Q4_2025 (latest)</option>
+          <option value="Q3_2025">Q3_2025</option>
+          <option value="July_2025">July_2025</option>
+          <option value="Q2_2025">Q2_2025</option>
+          <option value="Q1_2025">Q1_2025</option>
+          <option value="Q4_2024">Q4_2024</option>
+          <option value="Q3_2024">Q3_2024</option>
+          <option value="Q2_2024">Q2_2024</option>
+          <option value="April_2024">April_2024</option>
+          <option value="Q4_2023">Q4_2023</option>
+          <option value="Q1_2023">Q1_2023</option>
+          <option value="Q2_2021">Q2_2021</option>
+        </select>
+        <p class="hint">API path: <code id="psgcPath"></code></p>
+      </div>
+      <div>
+        <label>PSOC Version
+          <span class="hint">Used for occupational classification (practitioner roles)</span>
+        </label>
+        <select name="psoc_version" id="selPsocVersion">
+          <option value="2022">2022 (latest)</option>
+          <option value="2012">2012</option>
+        </select>
+        <p class="hint">API path: <code id="psocPath"></code></p>
+      </div>
+    </div>
+
+    <div style="margin-top:0.75rem">
+      <label style="display:flex; align-items:center; gap:8px;">
+        <input type="checkbox" name="psa_enable_huc_rules" id="chkHucRules">
+        Enable HUC-specific internal rules (synthetic districts + HUC barangay handling)
+      </label>
+      <p class="hint">Disable this to use PSA API behavior only, with no internal HUC special handling.</p>
+    </div>
+
+    <div style="margin-top:0.75rem">
+      <label>PSA API Token (shared for PSGC and PSOC)
+        <span class="hint" id="psaTokenHint"></span>
+      </label>
+      <input name="psa_token" type="password" placeholder="leave blank to keep current value">
+    </div>
+  </fieldset>
+
+  <fieldset class="card">
+    <legend>Networking</legend>
+    <div><label>HTTP timeout (seconds)</label><input name="http_timeout" type="number" step="1" style="width:120px"></div>
+  </fieldset>
+
+  <div class="card btn-row">
+    <button type="submit">Save configuration</button>
+    <button type="button" class="btn-secondary" id="btnTest">Test FHIR connection</button>
+    <button type="button" class="btn-secondary" id="btnTestPsa">Test PSA connection</button>
+  </div>
+  <div id="testResult" class="card" style="display:none"></div>
+</form>
+
+<script>
+const form = document.getElementById('configForm');
+
+function updatePaths() {
+  const base = (form.elements['psa_base_url'].value || 'https://classification.psa.gov.ph').replace(/\/$/, '');
+  const psgcV = form.elements['psa_version'].value;
+  const psocV = form.elements['psoc_version'].value;
+  document.getElementById('psgcPath').textContent = `${base}/psgc/${psgcV}/{level}?token=...`;
+  document.getElementById('psocPath').textContent = `${base}/psoc/${psocV}/{group}?token=...`;
+}
+
+async function loadConfig() {
+  const c = await API.get('/api/config');
+  ['fhir_base_url', 'terminology_base_url', 'psa_base_url', 'http_timeout'].forEach(k => {
+    if (form.elements[k]) form.elements[k].value = c[k] != null ? c[k] : '';
+  });
+  // Set select values
+  if (form.elements['psa_version']) form.elements['psa_version'].value = c.psa_version || 'Q4_2025';
+  if (form.elements['psoc_version']) form.elements['psoc_version'].value = c.psoc_version || '2022';
+  if (form.elements['psa_enable_huc_rules']) form.elements['psa_enable_huc_rules'].checked = c.psa_enable_huc_rules !== false;
+  document.getElementById('fhirTokenHint').textContent = c.fhir_auth_token_set ? '🔒 Token is currently set.' : 'No token set.';
+  document.getElementById('psaTokenHint').textContent = c.psa_token_set ? '🔒 Token is currently set.' : 'No token set.';
+  updatePaths();
+}
+
+form.elements['psa_base_url'].addEventListener('input', updatePaths);
+form.elements['psa_version'].addEventListener('change', updatePaths);
+form.elements['psoc_version'].addEventListener('change', updatePaths);
+
+form.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const obj = {};
+  new FormData(form).forEach((v, k) => { obj[k] = v; });
+  if (obj.http_timeout) obj.http_timeout = parseFloat(obj.http_timeout);
+  obj.psa_enable_huc_rules = !!form.elements['psa_enable_huc_rules'].checked;
+  try {
+    await API.send('PUT', '/api/config', obj);
+    toast('Configuration saved', 'ok');
+    form.elements['fhir_auth_token'].value = '';
+    form.elements['psa_token'].value = '';
+    await loadConfig();
+    refreshServerPill();
+  } catch (e) { toast(fhirErrorMessage(e), 'err'); }
+});
+
+document.getElementById('btnTest').addEventListener('click', async () => {
+  const box = document.getElementById('testResult');
+  box.style.display = ''; box.innerHTML = '<p class="muted">Testing FHIR connection…</p>';
+  try {
+    const h = await API.get('/api/health');
+    box.innerHTML = (h.fhir && h.fhir.reachable)
+      ? `<div class="issue information">✓ Connected to <strong>${escapeHtml(h.fhir.software || 'FHIR server')}</strong> (FHIR ${escapeHtml(h.fhir.fhirVersion || '?')}) at ${escapeHtml(h.fhir_base_url)}.</div>`
+      : `<div class="issue">✗ Unreachable: ${escapeHtml((h.fhir && h.fhir.error) || 'no response')}</div>`;
+  } catch (e) { box.innerHTML = '<div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div>'; }
+});
+
+document.getElementById('btnTestPsa').addEventListener('click', async () => {
+  const box = document.getElementById('testResult');
+  box.style.display = ''; box.innerHTML = '<p class="muted">Testing PSA PSGC API (fetching regions)…</p>';
+  try {
+    const r = await API.get('/api/psa/regions');
+    box.innerHTML = r.entries && r.entries.length
+      ? `<div class="issue information">✓ PSA PSGC reachable — ${r.entries.length} region(s) returned (version: ${escapeHtml(form.elements['psa_version'].value)}, source: ${escapeHtml(r.source)}).</div>`
+      : `<div class="issue warning">PSA API responded but returned no entries. Check version and token.</div>`;
+  } catch (e) { box.innerHTML = '<div class="issue">✗ PSA API error: ' + escapeHtml(fhirErrorMessage(e)) + '</div>'; }
+});
+
+loadConfig();
+</script>
+{% endblock %}
