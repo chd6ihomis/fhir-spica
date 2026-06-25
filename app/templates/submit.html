@@ -226,7 +226,53 @@
       <div><label>Weight (kg) *</label><input type="number" step="0.1" name="weight" required></div>
     </div>
     <div><label>Treatment given</label><textarea name="treatment_given"></textarea></div>
-    <div><label>Laboratory results (text)</label><input name="lab_text"></div>
+
+    <fieldset id="labFieldset">
+      <legend>Laboratory / Diagnostic Report <span class="muted">(optional)</span></legend>
+      <div class="field-row" style="align-items:center;margin-bottom:10px">
+        <label style="font-weight:600;margin-right:12px">Mode:</label>
+        <label style="font-weight:normal;margin-right:16px">
+          <input type="radio" name="lab_mode" value="manual" checked> Manual entry
+        </label>
+        <label style="font-weight:normal">
+          <input type="radio" name="lab_mode" value="file"> File attachment (PDF / image)
+        </label>
+      </div>
+
+      <!-- Manual entry mode -->
+      <div id="labManualPanel">
+        <div>
+          <label>Lab report title <span class="hint">(e.g. "Urinalysis Results — Kalibo Health Center")</span></label>
+          <input name="lab_title" id="inLabTitle" placeholder="e.g. Urinalysis Results — Kalibo Health Center">
+        </div>
+        <div>
+          <label>Findings / conclusion <span class="hint">(free-text, maps to DiagnosticReport.conclusion)</span></label>
+          <textarea name="lab_text" id="inLabText" rows="3" placeholder="e.g. Proteinuria 3+. Findings consistent with severe pre-eclampsia."></textarea>
+        </div>
+        <p class="hint" style="margin-top:4px">
+          This produces a DiagnosticReport with <code>conclusion</code> + <code>presentedForm[{title}]</code>,
+          matching the PH eReferral IG example (Ana Reyes).
+        </p>
+      </div>
+
+      <!-- File attachment mode -->
+      <div id="labFilePanel" style="display:none">
+        <div>
+          <label>Lab report title <span class="hint">(optional — auto-filled from filename)</span></label>
+          <input name="lab_title_file" id="inLabTitleFile" placeholder="e.g. Urinalysis Results">
+        </div>
+        <div>
+          <label>Lab findings text <span class="hint">(optional conclusion alongside the attachment)</span></label>
+          <textarea name="lab_text_file" id="inLabTextFile" rows="2" placeholder="Optional narrative to accompany the attached file"></textarea>
+        </div>
+        <div>
+          <label>Attach file <span class="hint">(PDF / image, max 512 KB)</span></label>
+          <input type="file" id="inLabFile" accept="application/pdf,image/*" style="padding:4px">
+          <div class="hint" id="labFileHint"></div>
+        </div>
+        <input type="hidden" name="lab_attachment" id="inLabAttachment">
+      </div>
+    </fieldset>
   </fieldset>
 
   <div class="btn-row">
@@ -272,5 +318,5 @@
   </div>
 </div>
 
-<script src="/static/js/submit.js?v=20260625b"></script>
+<script src="/static/js/submit.js?v=20260625c"></script>
 {% endblock %}

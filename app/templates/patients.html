@@ -24,10 +24,12 @@
         <th data-k="birthDate">Birth date</th>
         <th>Identifiers</th>
         <th>Referring facility</th>
+        <th>Receiving facility</th>
+        <th data-k="latest_referral_status">Referral status</th>
         <th>Actions</th>
       </tr>
     </thead>
-    <tbody id="patientBody"><tr><td colspan="6" class="muted">Search to load patients…</td></tr></tbody>
+    <tbody id="patientBody"><tr><td colspan="8" class="muted">Search to load patients…</td></tr></tbody>
   </table>
 </div>
 
@@ -290,6 +292,49 @@ function wireObservationViewToggle(container) {
   });
 }
 
+function computeAge(birthDateStr) {
+  if (!birthDateStr) return '';
+  const today = new Date();
+  const birth = new Date(birthDateStr);
+  let age = today.getFullYear() - birth.getFullYear();
+  const m = today.getMonth() - birth.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) age--;
+  return age < 0 ? '' : String(age) + ' yr' + (age !== 1 ? 's' : '');
+}
+
+function renderProcedureSection(procedures) {
+  if (!procedures || !procedures.length) return '';
+  const rows = procedures.map(pr => `<tr>
+    <td>${escapeHtml(pr.display || pr.code || 'Procedure')}</td>
+    <td class="muted">${escapeHtml(pr.performedDateTime ? formatDateTime(pr.performedDateTime) : '')}</td>
+    <td>${escapeHtml(pr.note || '')}</td>
+  </tr>`).join('');
+  return `<h3>Procedures / Treatment Given</h3>
+    <table><thead><tr><th>Procedure</th><th>Date</th><th>Notes</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderDiagnosticReportSection(reports) {
+  if (!reports || !reports.length) return '';
+  const rows = reports.map(dr => {
+    const attLinks = (dr.attachments || []).filter(a => a.data || a.url).map(a => {
+      if (a.data) {
+        const mime = a.contentType || 'application/octet-stream';
+        const href = `data:${mime};base64,${a.data}`;
+        return `<a href="${href}" download="${escapeHtml(a.title || 'report')}">${escapeHtml(a.title || 'Download')}</a>`;
+      }
+      return `<a href="${escapeHtml(a.url)}" target="_blank" rel="noopener">${escapeHtml(a.title || 'View')}</a>`;
+    }).join(' ');
+    return `<tr>
+      <td>${escapeHtml(dr.display || dr.code || 'Report')}</td>
+      <td class="muted">${escapeHtml(dr.effectiveDateTime ? formatDateTime(dr.effectiveDateTime) : '')}</td>
+      <td>${escapeHtml(dr.conclusion || '')}</td>
+      <td>${attLinks}</td>
+    </tr>`;
+  }).join('');
+  return `<h3>Laboratory / Diagnostic Reports</h3>
+    <table><thead><tr><th>Report</th><th>Date</th><th>Conclusion</th><th>Attachment</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 function wireConditionViewToggle(container) {
   const buttons = container.querySelectorAll('.cond-view-btn');
   const panels = container.querySelectorAll('.cond-panel');
@@ -312,20 +357,32 @@ function renderIdentifiers(identifiers) {
     .join(' ') || identifiers.map(i => `<span class="id-chip muted">${escapeHtml(i.value)}</span>`).join(' ');
 }
 
-function facilityChip(label) {
-  if (!label) return '<span class="muted">—</span>';
-  return `<span class="id-chip" title="Organization/${escapeHtml(label)}">Org ${escapeHtml(label)}</span>`;
+function facilityChip(orgId, orgName) {
+  if (!orgId && !orgName) return '<span class="muted">—</span>';
+  const parts = [];
+  if (orgName) parts.push(`<span>${escapeHtml(orgName)}</span>`);
+  if (orgId) parts.push(`<span class="id-chip" title="Organization/${escapeHtml(orgId)}">Org ${escapeHtml(orgId)}</span>`);
+  return parts.join(' ');
+}
+
+function referralStatusBadge(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '<span class="muted">—</span>';
+  const label = normalized === 'rejected' ? 'diverted' : normalized;
+  return `<span class="badge ${escapeHtml(normalized)}">${escapeHtml(label)}</span>`;
 }
 
 function render(rows) {
   const body = document.getElementById('patientBody');
-  if (!rows.length) { body.innerHTML = '<tr><td colspan="6" class="muted">No patients found.</td></tr>'; return; }
+  if (!rows.length) { body.innerHTML = '<tr><td colspan="8" class="muted">No patients found.</td></tr>'; return; }
   body.innerHTML = rows.map(p => `<tr>
     <td><strong>${escapeHtml(p.name || '(unnamed)')}</strong></td>
     <td>${escapeHtml(p.gender || '')}</td>
     <td>${escapeHtml(p.birthDate ? formatDate(p.birthDate) : '')}</td>
     <td>${renderIdentifiers(p.identifiers)}</td>
-    <td>${facilityChip(p.facility_label)}</td>
+    <td>${facilityChip(p.referring_org_id, p.referring_org_name)}</td>
+    <td>${facilityChip(p.receiving_org_id, p.receiving_org_name)}</td>
+    <td>${referralStatusBadge(p.latest_referral_status)}</td>
     <td class="action-cell">
       <button class="btn-secondary btn-sm" onclick="openPatientDetail('${escapeHtml(p.id)}')">View</button>
       <a class="button btn-sm" href="/submit?patientId=${escapeHtml(p.id)}">➕ Refer</a>
@@ -345,13 +402,13 @@ async function search() {
       params.push('organization_id=' + encodeURIComponent(facility.org_id || facility.code));
     }
   }
-  document.getElementById('patientBody').innerHTML = '<tr><td colspan="6" class="muted">Loading…</td></tr>';
+  document.getElementById('patientBody').innerHTML = '<tr><td colspan="8" class="muted">Loading…</td></tr>';
   try {
     const data = await API.get('/api/patients' + (params.length ? '?' + params.join('&') : ''));
     patients = data.patients || [];
     render(patients);
   } catch (e) {
-    document.getElementById('patientBody').innerHTML = '<tr><td colspan="6"><div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div></td></tr>';
+    document.getElementById('patientBody').innerHTML = '<tr><td colspan="8"><div class="issue">' + escapeHtml(fhirErrorMessage(e)) + '</div></td></tr>';
   }
 }
 
@@ -377,14 +434,35 @@ async function openPatientDetail(id) {
     const refHtml = (d.referrals || []).map(r =>
       `<tr><td>${escapeHtml(formatDateTime(r.authoredOn))}</td>
        <td><span class="badge ${escapeHtml(r.status)}">${escapeHtml(r.status)}</span></td>
-       <td class="muted">${escapeHtml(r.focus || '')}</td></tr>`
-    ).join('') || '<tr><td colspan="3" class="muted">No referrals found</td></tr>';
+       <td class="muted">${escapeHtml(r.focus || '')}</td>
+       <td class="muted">${escapeHtml(r.lastModified ? formatDateTime(r.lastModified) : '')}</td></tr>`
+    ).join('') || '<tr><td colspan="4" class="muted">No referrals found</td></tr>';
+
+    const srHtml = (d.serviceRequests || []).map(sr =>
+      `<tr>
+        <td>${escapeHtml(formatDateTime(sr.authoredOn))}</td>
+        <td><span class="badge ${escapeHtml(sr.status || '')}">${escapeHtml(sr.status || 'unknown')}</span></td>
+        <td>${escapeHtml(sr.requesterOrgName || '')}${sr.requesterOrg ? ` <span class="id-chip">Org ${escapeHtml(sr.requesterOrg)}</span>` : ''}</td>
+        <td>${escapeHtml(sr.performerOrgName || '')}${sr.performerOrg ? ` <span class="id-chip">Org ${escapeHtml(sr.performerOrg)}</span>` : ''}</td>
+        <td class="muted">${escapeHtml(sr.reason || sr.code || '—')}</td>
+      </tr>`
+    ).join('') || '<tr><td colspan="5" class="muted">No service requests found</td></tr>';
+
+    const encounterHtml = (d.encounters || []).map(enc =>
+      `<tr>
+        <td>${escapeHtml(enc.periodStart ? formatDateTime(enc.periodStart) : '')}</td>
+        <td>${escapeHtml(enc.periodEnd ? formatDateTime(enc.periodEnd) : '')}</td>
+        <td><span class="badge ${escapeHtml(enc.status || '')}">${escapeHtml(enc.status || 'unknown')}</span></td>
+        <td>${escapeHtml(enc.type || enc.class || '—')}</td>
+        <td>${escapeHtml(enc.serviceProviderDisplay || '')}${enc.serviceProvider ? ` <span class="id-chip">${escapeHtml(enc.serviceProvider)}</span>` : ''}</td>
+      </tr>`
+    ).join('') || '<tr><td colspan="5" class="muted">No encounters found</td></tr>';
 
     body.innerHTML = `
       <dl class="kv">
         <dt>Full name</dt><dd>${escapeHtml(p.name || '—')}</dd>
         <dt>Sex</dt><dd>${escapeHtml(p.gender || '—')}</dd>
-        <dt>Birth date</dt><dd>${escapeHtml(p.birthDate ? formatDate(p.birthDate) : '—')}</dd>
+        <dt>Birth date</dt><dd>${escapeHtml(p.birthDate ? formatDate(p.birthDate) : '—')}${p.birthDate ? ` <span class="muted">(Age ${computeAge(p.birthDate)})</span>` : ''}</dd>
         <dt>Address</dt><dd>${escapeHtml(p.address || '—')}</dd>
         ${(p.telecom||[]).map(t=>`<dt>${escapeHtml(t.system||'contact')}</dt><dd>${escapeHtml(t.value||'')}</dd>`).join('')}
       </dl>
@@ -393,7 +471,19 @@ async function openPatientDetail(id) {
       ${renderConditionSection(d.conditions || [], { heading: 'Active Conditions', emptyText: 'None on record' })}
       ${renderObservationSection(d.observations || [])}
       <h3>Referral History</h3>
-      <table><thead><tr><th>Authored</th><th>Status</th><th>Service Request</th></tr></thead><tbody>${refHtml}</tbody></table>`;
+      <table><thead><tr><th>Authored</th><th>Status</th><th>Service Request</th><th>Last modified</th></tr></thead><tbody>${refHtml}</tbody></table>
+      <h3>Service Request Timeline</h3>
+      <table><thead><tr><th>Authored</th><th>Status</th><th>Referring facility</th><th>Receiving facility</th><th>Reason / code</th></tr></thead><tbody>${srHtml}</tbody></table>
+      <h3>Encounter History</h3>
+      <table><thead><tr><th>Start</th><th>End</th><th>Status</th><th>Type</th><th>Service provider</th></tr></thead><tbody>${encounterHtml}</tbody></table>
+      ${renderProcedureSection(d.procedures || [])}
+      ${renderDiagnosticReportSection(d.diagnosticReports || [])}
+      <details style="margin-top:1rem">
+        <summary class="muted">Raw JSON</summary>
+        <div class="json-viewer" id="patientModalJson"></div>
+      </details>`;
+    const rawJsonEl = document.getElementById('patientModalJson');
+    if (rawJsonEl) rawJsonEl.textContent = JSON.stringify(d, null, 2);
     wireConditionViewToggle(body);
     wireObservationViewToggle(body);
   } catch (e) {

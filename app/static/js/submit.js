@@ -108,6 +108,27 @@ function formObject() {
   new FormData(form).forEach((v, k) => { if (v !== '') obj[k] = v; });
   if (obj.authored_on) obj.authored_on = localDateTimeToIsoOffset(obj.authored_on);
   if (obj.time_called) obj.time_called = localDateTimeToIsoOffset(obj.time_called);
+
+  // Resolve lab mode: merge mode-specific fields into the canonical keys.
+  // Only one of the two panels is active; the inactive panel's fields are ignored.
+  const labMode = (form.elements.lab_mode && form.elements.lab_mode.value) || 'manual';
+  if (labMode === 'manual') {
+    // lab_title and lab_text come directly from the manual panel.
+    delete obj.lab_title_file;
+    delete obj.lab_text_file;
+    // lab_attachment must be empty for manual mode.
+    delete obj.lab_attachment;
+  } else {
+    // File mode: promote the file-panel fields into the canonical keys.
+    if (obj.lab_title_file) { obj.lab_title = obj.lab_title_file; }
+    if (obj.lab_text_file)  { obj.lab_text  = obj.lab_text_file;  }
+    delete obj.lab_title_file;
+    delete obj.lab_text_file;
+    // lab_attachment is already in obj from the hidden field.
+  }
+  // Remove the mode discriminator — not a FHIR field.
+  delete obj.lab_mode;
+
   try { localStorage.setItem('pheref:lastForm', JSON.stringify(obj)); } catch (e) { /* ignore */ }
   return obj;
 }
@@ -239,6 +260,14 @@ function applyPractitionerSelection(side, practitioner) {
   setField(`${prefix}_prac_given`, practitioner.given || '');
   setField(`${prefix}_prac_prc`, practitioner.prc || '');
   setHint(hintId, `Selected: ${practitioner.display || practitioner.id || ''}`);
+
+  // Auto-apply role if the practitioner search result already includes role info
+  if (practitioner.role_code || practitioner.role_display) {
+    applyRoleSelection(side, {
+      code: practitioner.role_code || '',
+      display: practitioner.role_display || '',
+    });
+  }
   void autoResolvePractitionerRole(side);
 }
 
@@ -504,14 +533,37 @@ async function runTermModalSearch() {
       return;
     }
 
-    tbody.innerHTML = items.map((c) => `
-      <tr>
-        <td>${escapeHtml(c.display || c.name || '')}</td>
-        <td>${escapeHtml(c.code || '')}</td>
-        <td class="muted">${escapeHtml(c.system || '')}</td>
-        <td><button type="button" class="btn-secondary btn-sm select-concept"
-          data-item="${encodeURIComponent(JSON.stringify(c))}">Select</button></td>
-      </tr>`).join('');
+    if (termModal.mode === 'facilities') {
+      tbody.innerHTML = items.map((c) => {
+        const addrParts = [c.address_text, c.barangay, c.city, c.province, c.region, c.postal].filter(Boolean);
+        const addr = addrParts.join(', ');
+        return `<tr>
+          <td>${escapeHtml(c.display || c.name || '')}</td>
+          <td>${escapeHtml(c.nhfr_identifier || c.code || '')}</td>
+          <td class="muted" style="font-size:12px">${escapeHtml(addr)}</td>
+          <td><button type="button" class="btn-secondary btn-sm select-concept"
+            data-item="${encodeURIComponent(JSON.stringify(c))}">Select</button></td>
+        </tr>`;
+      }).join('');
+    } else if (termModal.mode === 'practitioners') {
+      tbody.innerHTML = items.map((c) => `
+        <tr>
+          <td>${escapeHtml(c.display || '')}</td>
+          <td>${escapeHtml(c.prc ? 'PRC ' + c.prc : '')}</td>
+          <td class="muted">${escapeHtml(c.role_display || c.role_code || '—')}</td>
+          <td><button type="button" class="btn-secondary btn-sm select-concept"
+            data-item="${encodeURIComponent(JSON.stringify(c))}">Select</button></td>
+        </tr>`).join('');
+    } else {
+      tbody.innerHTML = items.map((c) => `
+        <tr>
+          <td>${escapeHtml(c.display || c.name || '')}</td>
+          <td>${escapeHtml(c.code || '')}</td>
+          <td class="muted">${escapeHtml(c.system || '')}</td>
+          <td><button type="button" class="btn-secondary btn-sm select-concept"
+            data-item="${encodeURIComponent(JSON.stringify(c))}">Select</button></td>
+        </tr>`).join('');
+    }
 
     tbody.querySelectorAll('.select-concept').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -643,6 +695,20 @@ async function resetSubmitFormCompletely() {
   document.getElementById('dedupResult').innerHTML = '';
   document.getElementById('resChiefCode').innerHTML = '';
   document.getElementById('resDiagCode').innerHTML = '';
+  // Clear lab fields for both modes.
+  const labFile = document.getElementById('inLabFile');
+  if (labFile) labFile.value = '';
+  const labAttach = document.getElementById('inLabAttachment');
+  if (labAttach) labAttach.value = '';
+  const labHint = document.getElementById('labFileHint');
+  if (labHint) { labHint.textContent = ''; labHint.className = 'hint'; }
+  const labTitleFile = document.getElementById('inLabTitleFile');
+  if (labTitleFile) labTitleFile.value = '';
+  const labTextFile = document.getElementById('inLabTextFile');
+  if (labTextFile) labTextFile.value = '';
+  // Reset to manual entry mode.
+  const manualRadio = form.elements.lab_mode;
+  if (manualRadio) { manualRadio.value = 'manual'; _applyLabMode('manual'); }
   clearResultCards();
 
   setPrefillStatus('Form reset. All values are blank.');
@@ -695,8 +761,66 @@ function applyPatientPrefill(detail) {
     if (!form.elements.chief_complaint_text.value) {
       setField('chief_complaint_text', chief.display || chief.code || '');
     }
+    // Pre-fill clinical history from Condition.note
+    const clinicalNotes = conds
+      .map((c) => c.note || '')
+      .filter(Boolean);
+    if (clinicalNotes.length && form.elements.clinical_history && !form.elements.clinical_history.value) {
+      setField('clinical_history', clinicalNotes.join(' / '));
+    }
     const dx = conds.find((c) => c.code && c.code !== chief.code) || conds[0];
     applyClinicalConcept('diag', dx);
+  }
+
+  // Pre-fill vitals from most recent observations
+  const obs = detail.observations || [];
+  const VITAL_LOINC_MAP = {
+    '8480-6': 'bp_systolic', '271649006': 'bp_systolic',
+    '8462-4': 'bp_diastolic', '271650006': 'bp_diastolic',
+    '8867-4': 'heart_rate', '78564009': 'heart_rate',
+    '9279-1': 'resp_rate', '86290005': 'resp_rate',
+    '2708-6': 'spo2', '103228002': 'spo2', '59408-5': 'spo2',
+    '8310-5': 'temperature', '386725007': 'temperature',
+    '29463-7': 'weight', '27113001': 'weight',
+    '85354-9': null, // BP panel — handled via components
+  };
+  const filledVitals = new Set();
+  obs.forEach((o) => {
+    // Handle panel components (e.g. BP panel)
+    if (Array.isArray(o.components) && o.components.length) {
+      o.components.forEach((comp) => {
+        const field = VITAL_LOINC_MAP[comp.code];
+        if (field && !filledVitals.has(field) && comp.value != null) {
+          setField(field, String(comp.value));
+          filledVitals.add(field);
+        }
+      });
+      return;
+    }
+    const field = VITAL_LOINC_MAP[o.code];
+    if (field && !filledVitals.has(field) && o.numericValue != null) {
+      setField(field, String(o.numericValue));
+      filledVitals.add(field);
+    }
+  });
+
+  // Pre-fill treatment_given from most recent Procedure.note
+  const procs = detail.procedures || [];
+  if (procs.length && form.elements.treatment_given && !form.elements.treatment_given.value) {
+    const notes = procs.map((pr) => pr.note || '').filter(Boolean);
+    if (notes.length) setField('treatment_given', notes.join(' / '));
+  }
+
+  // Pre-fill lab_text and lab_title from most recent DiagnosticReport
+  const drs = detail.diagnosticReports || [];
+  if (drs.length) {
+    const latest = drs[0];
+    if (latest.conclusion && form.elements.lab_text && !form.elements.lab_text.value) {
+      setField('lab_text', latest.conclusion);
+    }
+    if (latest.display && form.elements.lab_title && !form.elements.lab_title.value) {
+      setField('lab_title', latest.display);
+    }
   }
 }
 
@@ -707,6 +831,73 @@ document.getElementById('btnDefaults').addEventListener('click', async () => {
   syncReferringFacilityFromTopbar();
   toast('Loaded defaults with selected referring facility', 'ok');
 });
+
+// Lab mode toggle: show/hide the manual vs file panels.
+function _applyLabMode(mode) {
+  const manual = document.getElementById('labManualPanel');
+  const file   = document.getElementById('labFilePanel');
+  if (!manual || !file) return;
+  if (mode === 'file') {
+    manual.style.display = 'none';
+    file.style.display = '';
+  } else {
+    manual.style.display = '';
+    file.style.display = 'none';
+    // Clear file-side data so it is never included in the payload.
+    const fi = document.getElementById('inLabFile');
+    if (fi) fi.value = '';
+    const ha = document.getElementById('inLabAttachment');
+    if (ha) ha.value = '';
+    const fh = document.getElementById('labFileHint');
+    if (fh) { fh.textContent = ''; fh.className = 'hint'; }
+  }
+}
+(function wireLabModeToggle() {
+  const radios = document.querySelectorAll('input[name="lab_mode"]');
+  radios.forEach(r => r.addEventListener('change', () => _applyLabMode(r.value)));
+  // Apply initial state (default: manual).
+  _applyLabMode('manual');
+})();
+
+// Lab file attachment — read as base64 and store in hidden field (max 512 KB)
+(function wireLabFileInput() {
+  const fileInput = document.getElementById('inLabFile');
+  const hiddenField = document.getElementById('inLabAttachment');
+  const hintEl = document.getElementById('labFileHint');
+  if (!fileInput || !hiddenField) return;
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) {
+      hiddenField.value = '';
+      if (hintEl) hintEl.textContent = '';
+      return;
+    }
+    const MAX_BYTES = 512 * 1024;
+    if (file.size > MAX_BYTES) {
+      hiddenField.value = '';
+      fileInput.value = '';
+      if (hintEl) { hintEl.textContent = 'File exceeds 512 KB limit. Please choose a smaller file.'; hintEl.className = 'hint issue'; }
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const dataUrl = ev.target.result;
+      const base64 = dataUrl.split(',')[1] || '';
+      hiddenField.value = base64;
+      if (hintEl) {
+        const kb = (file.size / 1024).toFixed(1);
+        hintEl.textContent = `Attached: ${file.name} (${kb} KB)`;
+        hintEl.className = 'hint';
+      }
+      // Auto-populate lab_title_file from filename if blank.
+      const titleEl = document.getElementById('inLabTitleFile');
+      if (titleEl && !titleEl.value) {
+        titleEl.value = file.name.replace(/\.[^.]+$/, '');
+      }
+    };
+    reader.readAsDataURL(file);
+  });
+})();
 
 document.getElementById('btnResetForm').addEventListener('click', resetSubmitFormCompletely);
 

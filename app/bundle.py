@@ -155,6 +155,28 @@ DEFAULTS: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+# SNOMED display-name corrections: some ValueSet expansions return abbreviated
+# displays that differ from the SNOMED preferred term validated by HAPI FHIR.
+# ---------------------------------------------------------------------------
+SCT_DISPLAY_CORRECTIONS: Dict[str, str] = {
+    # Corrected SNOMED preferred English displays (verified against the IG
+    # sample OperationOutcome reports from HAPI FHIR).
+    "440655000": "Outpatient environment",
+    # 73770003: HAPI FHIR validates against SNOMED preferred term; the IG
+    # uses this code for "Emergency" referral category.
+    "73770003":  "Hospital-based outpatient emergency care center",
+    "165197003": "Diagnostic assessment",     # reason-for-referral
+    "386629007": "Laboratory technologist",
+    "158965000": "Medical practitioner",
+}
+
+
+def _sct_display(code: Any, display: Any) -> Optional[str]:
+    """Return the SNOMED preferred display, correcting known mismatches."""
+    corrected = SCT_DISPLAY_CORRECTIONS.get(str(code or ""))
+    return corrected or (str(display) if display else None)
+
+
 def _val(form: Dict[str, Any], key: str, use_defaults: bool = False) -> Any:
     """Return form value; only fall back to ``DEFAULTS`` when explicitly enabled."""
     if form and key in form and form[key] not in (None, ""):
@@ -204,6 +226,20 @@ def _given(value: Any) -> List[str]:
     if value in (None, ""):
         return []
     return [p for p in str(value).split() if p]
+
+
+def _text(content: str) -> Dict[str, str]:
+    """Minimal generated FHIR narrative satisfying dom-6 best-practice check."""
+    safe = (
+        str(content or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    return {
+        "status": "generated",
+        "div": f'<div xmlns="http://www.w3.org/1999/xhtml">{safe}</div>',
+    }
 
 
 def _prune_none(value: Any) -> Any:
@@ -266,25 +302,31 @@ def _vital_observation(
     patient_ref: Dict[str, str],
     encounter_ref: Dict[str, str],
     effective: Any,
+    performer_ref: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     if quantity is None:
         return None
     codings = [primary]
     if secondary:
         codings.append(secondary)
+    label = primary.get("display", primary.get("code", "Observation"))
+    resource: Dict[str, Any] = {
+        "resourceType": "Observation",
+        "meta": {"profile": [f"{PHEREF_SD}/ereferral-observation"]},
+        "text": _text(label),
+        "status": "final",
+        "category": [VITAL_SIGNS_CATEGORY],
+        "code": {"coding": codings},
+        "subject": patient_ref,
+        "encounter": encounter_ref,
+        "effectiveDateTime": effective,
+        "valueQuantity": quantity,
+    }
+    if performer_ref:
+        resource["performer"] = [performer_ref]
     return {
         "fullUrl": full_url,
-        "resource": {
-            "resourceType": "Observation",
-            "meta": {"profile": [f"{PHEREF_SD}/ereferral-observation"]},
-            "status": "final",
-            "category": [VITAL_SIGNS_CATEGORY],
-            "code": {"coding": codings},
-            "subject": patient_ref,
-            "encounter": encounter_ref,
-            "effectiveDateTime": effective,
-            "valueQuantity": quantity,
-        },
+        "resource": resource,
         "request": {"method": "POST", "url": "Observation"},
     }
 
@@ -370,9 +412,15 @@ def build_referral_bundle(
     role_code_default = val("role_code")
     role_display_default = val("role_display")
     referring_role_code = val("referring_role_code") or role_code_default
-    referring_role_display = val("referring_role_display") or role_display_default
+    referring_role_display = _sct_display(
+        val("referring_role_code") or role_code_default,
+        val("referring_role_display") or role_display_default,
+    )
     receiving_role_code = val("receiving_role_code") or role_code_default
-    receiving_role_display = val("receiving_role_display") or role_display_default
+    receiving_role_display = _sct_display(
+        val("receiving_role_code") or role_code_default,
+        val("receiving_role_display") or role_display_default,
+    )
 
     # Practitioner display names (used on PractitionerRole-typed references such
     # as ServiceRequest.requester / Task.owner). The reference is a
@@ -418,6 +466,9 @@ def build_referral_bundle(
     patient_resource: Dict[str, Any] = {
         "resourceType": "Patient",
         "meta": {"profile": [f"{PHEREF_SD}/ereferral-patient"]},
+        "text": _text(
+            " ".join(p for p in [val("patient_given"), val("patient_family")] if p) or "Patient"
+        ),
         "identifier": patient_identifiers,
         "active": True,
         "name": [{
@@ -466,9 +517,11 @@ def build_referral_bundle(
         ("prac_rec", "receiving_prac_prc", "receiving_prac_family", "receiving_prac_given"),
     ]:
         prc_val = val(prc_key)
+        prac_name = " ".join(p for p in [val(giv_key), val(fam_key)] if p) or "Practitioner"
         prac_resource = {
             "resourceType": "Practitioner",
             "meta": {"profile": [f"{PHCORE_SD}/ph-core-practitioner"]},
+            "text": _text(f"Dr. {prac_name}"),
             "identifier": [{"system": PRC_SYSTEM, "value": prc_val}] if prc_val else None,
             "name": [{
                 "use": "official",
@@ -498,6 +551,7 @@ def build_referral_bundle(
         "resource": {
             "resourceType": "Organization",
             "meta": {"profile": [f"{PHCORE_SD}/ph-core-organization"]},
+            "text": _text(val("referring_org_name") or "Referring Organization"),
             "identifier": ref_org_identifiers or None,
             "name": val("referring_org_name"),
             "telecom": [{"system": "phone", "value": val("referring_org_phone"), "use": "work"}] if val("referring_org_phone") else None,
@@ -524,6 +578,7 @@ def build_referral_bundle(
         "resource": {
             "resourceType": "Organization",
             "meta": {"profile": [f"{PHCORE_SD}/ph-core-organization"]},
+            "text": _text(val("receiving_org_name") or "Receiving Organization"),
             "identifier": rec_org_identifiers or None,
             "name": val("receiving_org_name"),
             "telecom": [{"system": "phone", "value": val("receiving_org_phone"), "use": "work"}] if val("receiving_org_phone") else None,
@@ -542,6 +597,7 @@ def build_referral_bundle(
         "resource": {
             "resourceType": "PractitionerRole",
             "meta": {"profile": [f"{PHEREF_SD}/ereferral-practitioner-role"]},
+            "text": _text(referring_role_display or referring_role_code or "PractitionerRole (Referring)"),
             "identifier": [{"system": PRC_SYSTEM, "value": referring_prc}] if referring_prc else None,
             "practitioner": {"reference": ids["prac_ref"]},
             "organization": {"reference": ids["org_ref"]},
@@ -560,6 +616,7 @@ def build_referral_bundle(
         "resource": {
             "resourceType": "PractitionerRole",
             "meta": {"profile": [f"{PHEREF_SD}/ereferral-practitioner-role"]},
+            "text": _text(receiving_role_display or receiving_role_code or "PractitionerRole (Receiving)"),
             "identifier": [{"system": PRC_SYSTEM, "value": receiving_prc}] if receiving_prc else None,
             "practitioner": {"reference": ids["prac_rec"]},
             "organization": {"reference": ids["org_rec"]},
@@ -578,10 +635,11 @@ def build_referral_bundle(
     sr_resource: Dict[str, Any] = {
         "resourceType": "ServiceRequest",
         "meta": {"profile": [f"{PHEREF_SD}/ereferral-service-request"]},
+        "text": _text(f"Patient referral — {val('referral_category_display') or 'ServiceRequest'}"),
         "status": "active",
         "intent": "order",
         "priority": priority,
-        "category": [_codeable([_coding(SCT, category_code, val("referral_category_display"))])] if category_code else None,
+        "category": [_codeable([_coding(SCT, category_code, _sct_display(category_code, val("referral_category_display")))])] if category_code else None,
         "code": {"coding": [{"system": SCT, "code": "3457005", "display": "Patient referral"}]},
         "subject": patient_ref,
         "encounter": encounter_ref,
@@ -589,7 +647,7 @@ def build_referral_bundle(
         "authoredOn": authored,
         "requester": {"reference": ids["role_ref"], "display": referring_prac_display},
         "performer": [{"reference": ids["role_rec"], "display": receiving_prac_display}],
-        "reasonCode": [_codeable([_coding(SCT, val("reason_code"), val("reason_display"))])] if val("reason_code") else None,
+        "reasonCode": [_codeable([_coding(SCT, val("reason_code"), _sct_display(val("reason_code"), val("reason_display")))])] if val("reason_code") else None,
         "reasonReference": [{"reference": ids["cond_dx"]}],
     }
     if val("task_note"):
@@ -606,6 +664,7 @@ def build_referral_bundle(
         "resource": {
             "resourceType": "Encounter",
             "meta": {"profile": [f"{PHEREF_SD}/ereferral-encounter"]},
+            "text": _text("Encounter: ambulatory"),
             "status": "finished",
             "class": {"system": V3_ACT_CODE, "code": "AMB", "display": "ambulatory"},
             "subject": patient_ref,
@@ -621,6 +680,7 @@ def build_referral_bundle(
         cond_chief: Dict[str, Any] = {
             "resourceType": "Condition",
             "meta": {"profile": [f"{PHEREF_SD}/ereferral-condition"]},
+            "text": _text(chief_display or chief_text or chief_code or "Condition (Chief Complaint)"),
             "clinicalStatus": {"coding": [{"system": COND_CLINICAL, "code": "active"}]},
             "category": [{"coding": [{"system": COND_CATEGORY, "code": "problem-list-item", "display": "Problem List Item"}]}],
             "code": _codeable([_coding(SCT, chief_code, chief_display)], text=chief_text),
@@ -645,6 +705,7 @@ def build_referral_bundle(
             "resource": _prune_none({
                 "resourceType": "Condition",
                 "meta": {"profile": [f"{PHEREF_SD}/ereferral-condition"]},
+                "text": _text(dx_display or dx_text or dx_code or "Condition (Diagnosis)"),
                 "clinicalStatus": {"coding": [{"system": COND_CLINICAL, "code": "active"}]},
                 "verificationStatus": {"coding": [{"system": COND_VER_STATUS, "code": "provisional", "display": "Provisional"}]},
                 "category": [{"coding": [{"system": COND_CATEGORY, "code": "encounter-diagnosis", "display": "Encounter Diagnosis"}]}],
@@ -681,6 +742,7 @@ def build_referral_bundle(
             "resource": {
                 "resourceType": "Observation",
                 "meta": {"profile": [f"{PHEREF_SD}/ereferral-observation"]},
+                "text": _text("Blood pressure"),
                 "status": "final",
                 "category": [VITAL_SIGNS_CATEGORY],
                 "code": {"coding": [
@@ -690,6 +752,7 @@ def build_referral_bundle(
                 "subject": patient_ref,
                 "encounter": encounter_ref,
                 "effectiveDateTime": authored,
+                "performer": [{"reference": ids["role_ref"]}],
                 "component": components,
             },
             "request": {"method": "POST", "url": "Observation"},
@@ -712,6 +775,7 @@ def build_referral_bundle(
             patient_ref,
             encounter_ref,
             authored,
+            performer_ref={"reference": ids["role_ref"]},
         )
         if obs_entry:
             entries.append(obs_entry)
@@ -723,6 +787,7 @@ def build_referral_bundle(
             "resource": {
                 "resourceType": "Procedure",
                 "meta": {"profile": [f"{PHEREF_SD}/ereferral-procedure"]},
+                "text": _text("Drug therapy"),
                 "status": "completed",
                 "code": {"coding": [{"system": SCT, "code": "416608005", "display": "Drug therapy"}]},
                 "subject": patient_ref,
@@ -733,10 +798,15 @@ def build_referral_bundle(
             "request": {"method": "POST", "url": "Procedure"},
         })
 
-    # ---- 19. DiagnosticReport: urinalysis ----
-    if val("lab_text") or val("lab_attachment"):
+    # ---- 19. DiagnosticReport: urinalysis / laboratory ----
+    # Renders in two modes (both IG-conformant):
+    #   Manual entry: lab_text (conclusion) + lab_title (presentedForm.title)
+    #   File attachment: lab_attachment (base64 data) + optional lab_title
+    # A title alone is sufficient to produce a valid report with presentedForm.
+    if val("lab_text") or val("lab_attachment") or val("lab_title"):
         diag_report: Dict[str, Any] = {
             "resourceType": "DiagnosticReport",
+            "text": _text(val("lab_title") or val("lab_text") or "Laboratory result"),
             "status": "final",
             "code": {"coding": [{"system": LOINC, "code": "24356-8", "display": "Urinalysis complete panel - Urine"}]},
             "subject": patient_ref,
@@ -747,12 +817,18 @@ def build_referral_bundle(
             diag_report["conclusion"] = val("lab_text")
         attachment = val("lab_attachment")
         if attachment:
-            diag_report["presentedForm"] = [{
-                "contentType": "application/pdf",
-                "data": attachment,
-                "title": val("lab_title") or "Laboratory result",
-            }]
+            # HAPI FHIR (this connectathon server) cannot validate MIME types
+            # against the urn:ietf:bcp:13 CodeSystem because that CodeSystem
+            # is not loaded, causing an error-severity OperationOutcome issue
+            # (HTTP 422). Per FHIR R4 att-1, contentType SHOULD be present
+            # when data is given, but omitting it avoids the BCP-13 lookup.
+            # The base64 data is preserved and the report remains clinically useful.
+            presented: Dict[str, Any] = {"data": attachment}
+            if val("lab_title"):
+                presented["title"] = val("lab_title")
+            diag_report["presentedForm"] = [presented]
         elif val("lab_title"):
+            # Manual-entry mode: IG example pattern — presentedForm with title only.
             diag_report["presentedForm"] = [{"title": val("lab_title")}]
         entries.append({
             "fullUrl": ids["diagnostic_report"],
@@ -764,6 +840,7 @@ def build_referral_bundle(
     task_resource: Dict[str, Any] = {
         "resourceType": "Task",
         "meta": {"profile": [f"{PHEREF_SD}/ereferral-task"]},
+        "text": _text("Task: Patient referral"),
         "status": "requested",
         "intent": "order",
         "priority": priority,
@@ -789,6 +866,7 @@ def build_referral_bundle(
         "resource": {
             "resourceType": "Provenance",
             "meta": {"profile": [f"{PHEREF_SD}/ereferral-provenance"]},
+            "text": _text("Provenance: eReferral bundle creation"),
             "target": [{"reference": ids["service_request"]}],
             "recorded": authored,
             "activity": {"coding": [{"system": V3_DATA_OPERATION, "code": "CREATE", "display": "create"}]},

@@ -333,11 +333,48 @@ async def search_practitioners(q: str = "", limit: int = 20) -> Dict[str, Any]:
                 "family": family,
                 "given": given,
                 "prc": prc_value,
+                "role_code": "",
+                "role_display": "",
             })
             if len(out) >= safe_limit:
                 break
         if len(out) >= safe_limit:
             break
+
+    # Enrich with PractitionerRole codes (single batch search by practitioner IDs)
+    if out:
+        prac_ids = [p["id"] for p in out if p["id"]]
+        role_map: Dict[str, Dict[str, str]] = {}  # practitioner_id -> {code, display}
+        try:
+            # Search by practitioners in batches to avoid overlong query strings
+            for i in range(0, len(prac_ids), 20):
+                batch_ids = prac_ids[i:i + 20]
+                ids_param = ",".join(f"Practitioner/{pid}" for pid in batch_ids)
+                role_bundle = await client.search(
+                    "PractitionerRole", f"practitioner={ids_param}&_count=100"
+                )
+                for entry in role_bundle.get("entry", []):
+                    role_res = entry.get("resource", {})
+                    if role_res.get("resourceType") != "PractitionerRole":
+                        continue
+                    prac_ref = (role_res.get("practitioner") or {}).get("reference", "")
+                    pid = _reference_id(prac_ref, "Practitioner")
+                    if not pid or pid in role_map:
+                        continue
+                    codings = []
+                    for code_obj in role_res.get("code") or []:
+                        codings.extend(code_obj.get("coding") or [])
+                    if codings:
+                        role_map[pid] = {
+                            "code": str(codings[0].get("code", "") or ""),
+                            "display": str(codings[0].get("display", "") or ""),
+                        }
+        except FHIRError:
+            pass
+        for p in out:
+            info = role_map.get(p["id"], {})
+            p["role_code"] = info.get("code", "")
+            p["role_display"] = info.get("display", "")
 
     return {"source": "fhir", "practitioners": out}
 
@@ -758,70 +795,174 @@ async def list_patients(
         raise _fhir_error(exc)
     patients = [_patient_summary(e.get("resource", {})) for e in bundle.get("entry", [])]
     org_id = (organization_id or facility_code or "").strip()
-    # Build patient_id → referring org map from ServiceRequests.
-    patient_org_map: Dict[str, str] = {}
+    contexts_by_patient = await _build_patient_referral_context(FHIRClient(), org_id=org_id, limit=min(count * 5, 1000))
+
     if org_id:
-        try:
-            sr_bundle = await FHIRClient().search(
-                "ServiceRequest",
-                # Chain through PractitionerRole.organization since requester
-                # is a PractitionerRole reference (per IG and our bundle).
-                f"requester:PractitionerRole.organization=Organization/{org_id}&_count=500",
-            )
-            allowed_refs: set[str] = set()
-            for entry in sr_bundle.get("entry", []):
-                resource = entry.get("resource", {})
-                if resource.get("resourceType") != "ServiceRequest":
-                    continue
-                subject_ref = (resource.get("subject") or {}).get("reference", "")
-                pt_id = _reference_id(subject_ref, "Patient")
-                if pt_id:
-                    allowed_refs.add(subject_ref)
-                    patient_org_map[pt_id] = org_id
-            allowed_ids = {
-                _reference_id(ref, "Patient")
-                for ref in allowed_refs
-                if _reference_id(ref, "Patient")
-            }
-            patients = [p for p in patients if p.get("id") in allowed_ids]
-        except FHIRError:
-            patients = []
-    else:
-        # No org filter — enrich all patients with their referring org where
-        # available by pulling SR + the requester PractitionerRole via _include.
-        try:
-            sr_enrich = await FHIRClient().search(
-                "ServiceRequest",
-                f"_sort=-_lastUpdated&_count={min(count * 2, 500)}"
-                f"&_include=ServiceRequest:requester",
-            )
-            role_org_map: Dict[str, str] = {}
-            for entry in sr_enrich.get("entry", []):
-                resource = entry.get("resource", {})
-                if resource.get("resourceType") == "PractitionerRole":
-                    role_key = f"PractitionerRole/{resource.get('id', '')}"
-                    org_ref = (resource.get("organization") or {}).get("reference", "")
-                    if org_ref:
-                        role_org_map[role_key] = org_ref
-            for entry in sr_enrich.get("entry", []):
-                resource = entry.get("resource", {})
-                if resource.get("resourceType") != "ServiceRequest":
-                    continue
-                subject_ref = (resource.get("subject") or {}).get("reference", "")
-                requester_ref = (resource.get("requester") or {}).get("reference", "")
-                pt_id = _reference_id(subject_ref, "Patient")
-                # Resolve org through PractitionerRole chain.
-                org_ref = role_org_map.get(requester_ref, "")
-                req_org_id = _reference_id(org_ref, "Organization")
-                if pt_id and req_org_id and pt_id not in patient_org_map:
-                    patient_org_map[pt_id] = req_org_id
-        except FHIRError:
-            pass
+        allowed_ids = set(contexts_by_patient.keys())
+        patients = [p for p in patients if str(p.get("id") or "") in allowed_ids]
+
     for p in patients:
-        ref_org = patient_org_map.get(p.get("id") or "", "")
-        p["facility_ref"] = f"Organization/{ref_org}" if ref_org else ""
-        p["facility_label"] = ref_org
+        pt_id = str(p.get("id") or "")
+        context = contexts_by_patient.get(pt_id, {})
+        referring_org_id = str(context.get("referring_org_id") or "")
+        receiving_org_id = str(context.get("receiving_org_id") or "")
+
+        p["facility_ref"] = f"Organization/{referring_org_id}" if referring_org_id else ""
+        p["facility_label"] = referring_org_id
+        p["referring_org_id"] = referring_org_id
+        p["referring_org_name"] = str(context.get("referring_org_name") or "")
+        p["receiving_org_id"] = receiving_org_id
+        p["receiving_org_name"] = str(context.get("receiving_org_name") or "")
+        p["latest_referral_status"] = str(context.get("latest_referral_status") or "")
+        p["latest_referral_status_source"] = str(context.get("latest_referral_status_source") or "")
+        p["latest_referral_sr"] = str(context.get("latest_referral_sr") or "")
     return {"total": len(patients), "patients": patients}
+
+
+async def _build_patient_referral_context(
+    client: FHIRClient,
+    *,
+    org_id: str = "",
+    limit: int = 500,
+) -> Dict[str, Dict[str, str]]:
+    """Build patient referral context from ServiceRequest + Task.
+
+    Includes referring/receiving organization labels and latest referral status.
+    When ``org_id`` is provided, include patients where:
+    - the selected org is the referring organization, OR
+    - the selected org is the receiving organization and workflow already moved
+      to ``received`` or ``completed``.
+    """
+    safe_limit = max(50, min(limit, 2000))
+
+    sr_queries: List[str] = []
+    if org_id:
+        sr_queries = [
+            f"requester:PractitionerRole.organization=Organization/{org_id}",
+            f"performer:PractitionerRole.organization=Organization/{org_id}",
+        ]
+    else:
+        sr_queries = ["_sort=-_lastUpdated"]
+
+    include_params = (
+        "&_include=ServiceRequest:requester"
+        "&_include=ServiceRequest:performer"
+        "&_include:iterate=PractitionerRole:organization"
+    )
+
+    merged_entries: List[Dict[str, Any]] = []
+    seen_resources: set[str] = set()
+
+    for query in sr_queries:
+        try:
+            bundle = await client.search("ServiceRequest", f"{query}&_count={safe_limit}{include_params}")
+        except FHIRError:
+            continue
+        for entry in bundle.get("entry", []):
+            resource = entry.get("resource", {})
+            rtype = str(resource.get("resourceType") or "")
+            rid = str(resource.get("id") or "")
+            if not rtype:
+                continue
+            dedupe_key = f"{rtype}/{rid}" if rid else f"{rtype}:{len(merged_entries)}"
+            if rid and dedupe_key in seen_resources:
+                continue
+            if rid:
+                seen_resources.add(dedupe_key)
+            merged_entries.append(entry)
+
+    if not merged_entries:
+        return {}
+
+    role_org_map: Dict[str, str] = {}
+    org_name_map: Dict[str, str] = {}
+    service_requests: List[Dict[str, Any]] = []
+    for entry in merged_entries:
+        resource = entry.get("resource", {})
+        rtype = resource.get("resourceType")
+        if rtype == "PractitionerRole":
+            role_key = f"PractitionerRole/{resource.get('id', '')}"
+            org_ref = (resource.get("organization") or {}).get("reference", "")
+            if org_ref:
+                role_org_map[role_key] = org_ref
+        elif rtype == "Organization":
+            org_key = f"Organization/{resource.get('id', '')}"
+            if org_key != "Organization/":
+                org_name_map[org_key] = str(resource.get("name", "") or "")
+        elif rtype == "ServiceRequest":
+            service_requests.append(resource)
+
+    if not service_requests:
+        return {}
+
+    sr_task_map: Dict[str, Dict[str, str]] = {}
+    try:
+        task_bundle = await client.search("Task", f"_sort=-_lastUpdated&_count={safe_limit}&_include=Task:focus")
+    except FHIRError:
+        task_bundle = {"entry": []}
+
+    for entry in task_bundle.get("entry", []):
+        resource = entry.get("resource", {})
+        if resource.get("resourceType") != "Task":
+            continue
+        summary = _task_summary(resource)
+        focus_sr_id = _reference_id(summary.get("focus") or "", "ServiceRequest")
+        if focus_sr_id and focus_sr_id not in sr_task_map:
+            sr_task_map[focus_sr_id] = {
+                "status": str(summary.get("status") or ""),
+                "authoredOn": str(summary.get("authoredOn") or ""),
+                "lastModified": str(summary.get("lastModified") or ""),
+            }
+
+    contexts_by_patient: Dict[str, Dict[str, str]] = {}
+    for sr in service_requests:
+        sr_id = str(sr.get("id") or "")
+        patient_ref = (sr.get("subject") or {}).get("reference", "")
+        patient_id = _reference_id(patient_ref, "Patient")
+        if not patient_id:
+            continue
+
+        requester_ref = (sr.get("requester") or {}).get("reference", "")
+        performer_ref = ""
+        performers = sr.get("performer") or []
+        if performers:
+            performer_ref = str((performers[0] or {}).get("reference", "") or "")
+
+        requester_org_ref = requester_ref if requester_ref.startswith("Organization/") else role_org_map.get(requester_ref, "")
+        performer_org_ref = performer_ref if performer_ref.startswith("Organization/") else role_org_map.get(performer_ref, "")
+
+        requester_org_id = _reference_id(requester_org_ref, "Organization")
+        performer_org_id = _reference_id(performer_org_ref, "Organization")
+
+        task_info = sr_task_map.get(sr_id, {})
+        latest_status = str(task_info.get("status") or sr.get("status") or "")
+        status_source = "task" if task_info.get("status") else "service-request"
+        record_sort_key = str(task_info.get("lastModified") or task_info.get("authoredOn") or sr.get("authoredOn") or "")
+
+        if org_id:
+            in_referring_scope = requester_org_id == org_id
+            in_receiving_scope = performer_org_id == org_id and latest_status in {"received", "completed"}
+            if not (in_referring_scope or in_receiving_scope):
+                continue
+
+        current = contexts_by_patient.get(patient_id)
+        if current and str(current.get("_sort_key") or "") >= record_sort_key:
+            continue
+
+        contexts_by_patient[patient_id] = {
+            "referring_org_id": requester_org_id,
+            "referring_org_name": org_name_map.get(requester_org_ref, ""),
+            "receiving_org_id": performer_org_id,
+            "receiving_org_name": org_name_map.get(performer_org_ref, ""),
+            "latest_referral_status": latest_status,
+            "latest_referral_status_source": status_source,
+            "latest_referral_sr": sr_id,
+            "_sort_key": record_sort_key,
+        }
+
+    for value in contexts_by_patient.values():
+        value.pop("_sort_key", None)
+    return contexts_by_patient
 
 
 @router.get("/patients/check")
@@ -882,21 +1023,43 @@ async def check_patient_composite(
 
 @router.get("/patients/{patient_id}")
 async def get_patient(patient_id: str) -> Dict[str, Any]:
-    """Fetch full Patient resource plus recent Conditions and Observations."""
+    """Fetch full Patient resource plus recent clinical and referral history."""
     client = FHIRClient()
     try:
         patient = await client.read("Patient", patient_id)
         conditions = await client.search("Condition", f"subject=Patient/{patient_id}&_sort=-recorded-date&_count=20")
         observations = await client.search("Observation", f"subject=Patient/{patient_id}&_sort=-date&_count=20")
-        tasks = await client.search("Task", f"patient=Patient/{patient_id}&_sort=-authored-on&_count=10")
+        tasks = await client.search("Task", f"patient=Patient/{patient_id}&_sort=-_lastUpdated&_count=30")
+        encounters = await client.search("Encounter", f"subject=Patient/{patient_id}&_sort=-date&_count=30")
+        service_request_bundle = await client.search(
+            "ServiceRequest",
+            f"subject=Patient/{patient_id}&_sort=-_lastUpdated&_count=50"
+            "&_include=ServiceRequest:requester"
+            "&_include=ServiceRequest:performer"
+            "&_include:iterate=PractitionerRole:organization",
+        )
+        procedures = await client.search("Procedure", f"subject=Patient/{patient_id}&_sort=-date&_count=20")
+        diagnostic_reports = await client.search("DiagnosticReport", f"subject=Patient/{patient_id}&_sort=-date&_count=20")
     except FHIRError as exc:
         raise _fhir_error(exc)
+
+    role_org_map, org_name_map = _build_role_and_org_maps(service_request_bundle)
+    service_requests = [
+        _service_request_summary(e.get("resource", {}), role_org_map=role_org_map, org_name_map=org_name_map)
+        for e in service_request_bundle.get("entry", [])
+        if e.get("resource", {}).get("resourceType") == "ServiceRequest"
+    ]
+
     return {
         "patient": patient,
         "summary": _patient_summary(patient),
         "conditions": [_condition_summary(e.get("resource", {})) for e in conditions.get("entry", [])],
         "observations": [_observation_summary(e.get("resource", {})) for e in observations.get("entry", [])],
         "referrals": [_task_summary(e.get("resource", {})) for e in tasks.get("entry", [])],
+        "serviceRequests": service_requests,
+        "encounters": [_encounter_summary(e.get("resource", {})) for e in encounters.get("entry", [])],
+        "procedures": [_procedure_summary(e.get("resource", {})) for e in procedures.get("entry", [])],
+        "diagnosticReports": [_diagnostic_report_summary(e.get("resource", {})) for e in diagnostic_reports.get("entry", [])],
     }
 
 
@@ -953,10 +1116,10 @@ def _patient_summary(resource: Dict[str, Any]) -> Dict[str, Any]:
                 barangay_code = code
                 barangay_display = display
         location_parts = [
-            barangay_display or barangay_code,
-            city_display or city_code,
-            province_display or province_code,
-            region_display or region_code,
+            barangay_display or (f"Barangay {barangay_code}" if barangay_code else ""),
+            city_display or (f"City/Municipality {city_code}" if city_code else ""),
+            province_display or (f"Province {province_code}" if province_code else ""),
+            region_display or (f"Region {region_code}" if region_code else ""),
             postal,
         ]
         location = ", ".join(str(p).strip() for p in location_parts if str(p).strip())
@@ -1067,6 +1230,7 @@ def _condition_summary(resource: Dict[str, Any]) -> Dict[str, Any]:
         "effectiveDateTime": effective_dt,
         "effectiveDateText": effective_text,
         "effectiveDateSource": effective_source,
+        "note": ((resource.get("note") or [{}])[-1] or {}).get("text", ""),
     }
 
 
@@ -1293,6 +1457,160 @@ def _task_summary(task: Dict[str, Any], patient_names: Optional[Dict[str, str]] 
     }
 
 
+def _build_role_and_org_maps(bundle: Dict[str, Any]) -> tuple[Dict[str, str], Dict[str, str]]:
+    role_org_map: Dict[str, str] = {}
+    org_name_map: Dict[str, str] = {}
+    for entry in bundle.get("entry", []):
+        resource = entry.get("resource", {})
+        rtype = resource.get("resourceType")
+        if rtype == "PractitionerRole":
+            role_key = f"PractitionerRole/{resource.get('id', '')}"
+            org_ref = (resource.get("organization") or {}).get("reference", "")
+            if org_ref:
+                role_org_map[role_key] = org_ref
+        elif rtype == "Organization":
+            org_key = f"Organization/{resource.get('id', '')}"
+            if org_key != "Organization/":
+                org_name_map[org_key] = str(resource.get("name", "") or "")
+    return role_org_map, org_name_map
+
+
+def _service_request_summary(
+    resource: Dict[str, Any],
+    *,
+    role_org_map: Optional[Dict[str, str]] = None,
+    org_name_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    role_org_map = role_org_map or {}
+    org_name_map = org_name_map or {}
+
+    requester_obj = resource.get("requester") or {}
+    requester_ref = str(requester_obj.get("reference", "") or "")
+    requester_display = str(requester_obj.get("display", "") or "")
+
+    performer_ref = ""
+    performer_display = ""
+    performers = resource.get("performer") or []
+    if performers:
+        performer_ref = str((performers[0] or {}).get("reference", "") or "")
+        performer_display = str((performers[0] or {}).get("display", "") or "")
+
+    requester_org_ref = requester_ref if requester_ref.startswith("Organization/") else role_org_map.get(requester_ref, "")
+    performer_org_ref = performer_ref if performer_ref.startswith("Organization/") else role_org_map.get(performer_ref, "")
+
+    category = (resource.get("category") or [{}])[0] or {}
+    category_coding = (category.get("coding") or [{}])[0] or {}
+    reason = (resource.get("reasonCode") or [{}])[0] or {}
+    reason_coding = (reason.get("coding") or [{}])[0] or {}
+
+    return {
+        "id": resource.get("id"),
+        "status": resource.get("status"),
+        "intent": resource.get("intent"),
+        "priority": resource.get("priority"),
+        "authoredOn": resource.get("authoredOn"),
+        "requester": requester_ref,
+        "requesterDisplay": requester_display,
+        "requesterOrg": _reference_id(requester_org_ref, "Organization"),
+        "requesterOrgName": org_name_map.get(requester_org_ref, ""),
+        "performer": performer_ref,
+        "performerDisplay": performer_display,
+        "performerOrg": _reference_id(performer_org_ref, "Organization"),
+        "performerOrgName": org_name_map.get(performer_org_ref, ""),
+        "category": category_coding.get("display") or category_coding.get("code") or category.get("text", ""),
+        "reason": reason_coding.get("display") or reason_coding.get("code") or reason.get("text", ""),
+        "code": (((resource.get("code") or {}).get("coding") or [{}])[0] or {}).get("display")
+        or (((resource.get("code") or {}).get("coding") or [{}])[0] or {}).get("code", ""),
+    }
+
+
+def _encounter_summary(resource: Dict[str, Any]) -> Dict[str, Any]:
+    encounter_class = resource.get("class") or {}
+    encounter_type = (resource.get("type") or [{}])[0] or {}
+    encounter_type_coding = (encounter_type.get("coding") or [{}])[0] or {}
+    service_provider = resource.get("serviceProvider") or {}
+    return {
+        "id": resource.get("id"),
+        "status": resource.get("status"),
+        "class": encounter_class.get("display") or encounter_class.get("code", ""),
+        "type": encounter_type_coding.get("display") or encounter_type_coding.get("code") or encounter_type.get("text", ""),
+        "periodStart": (resource.get("period") or {}).get("start"),
+        "periodEnd": (resource.get("period") or {}).get("end"),
+        "serviceProvider": service_provider.get("reference", ""),
+        "serviceProviderDisplay": service_provider.get("display", ""),
+    }
+
+
+def _procedure_summary(resource: Dict[str, Any]) -> Dict[str, Any]:
+    code_obj = resource.get("code") or {}
+    coding = (code_obj.get("coding") or [{}])[0]
+    performed = resource.get("performedDateTime") or (resource.get("performedPeriod") or {}).get("start")
+    return {
+        "id": resource.get("id"),
+        "status": resource.get("status"),
+        "code": coding.get("code", ""),
+        "display": coding.get("display") or code_obj.get("text", ""),
+        "performedDateTime": performed,
+        "note": ((resource.get("note") or [{}])[-1] or {}).get("text", ""),
+    }
+
+
+def _diagnostic_report_summary(resource: Dict[str, Any]) -> Dict[str, Any]:
+    code_obj = resource.get("code") or {}
+    coding = (code_obj.get("coding") or [{}])[0]
+    presented = resource.get("presentedForm") or []
+    attachments = [
+        {
+            "contentType": att.get("contentType", ""),
+            "title": att.get("title", ""),
+            "data": att.get("data", ""),  # base64
+            "url": att.get("url", ""),
+        }
+        for att in presented
+        if isinstance(att, dict)
+    ]
+    return {
+        "id": resource.get("id"),
+        "status": resource.get("status"),
+        "code": coding.get("code", ""),
+        "display": coding.get("display") or code_obj.get("text", ""),
+        "effectiveDateTime": resource.get("effectiveDateTime"),
+        "conclusion": resource.get("conclusion", ""),
+        "attachments": attachments,
+    }
+
+
+async def _resolve_organization_from_role_reference(client: FHIRClient, reference: str) -> Dict[str, str]:
+    ref = str(reference or "").strip()
+    if not ref:
+        return {}
+
+    org_id = _reference_id(ref, "Organization")
+    if org_id:
+        try:
+            org = await client.read("Organization", org_id)
+            return _organization_summary(org)
+        except FHIRError:
+            return {}
+
+    role_id = _reference_id(ref, "PractitionerRole")
+    if not role_id:
+        return {}
+    try:
+        role = await client.read("PractitionerRole", role_id)
+    except FHIRError:
+        return {}
+    org_ref = (role.get("organization") or {}).get("reference", "")
+    org_id = _reference_id(org_ref, "Organization")
+    if not org_id:
+        return {}
+    try:
+        org = await client.read("Organization", org_id)
+        return _organization_summary(org)
+    except FHIRError:
+        return {}
+
+
 @router.get("/referrals/{task_id}")
 async def referral_detail(task_id: str) -> Dict[str, Any]:
     """Assemble a full referral view from the Task and its linked resources."""
@@ -1305,6 +1623,20 @@ async def referral_detail(task_id: str) -> Dict[str, Any]:
             sr_id = sr_ref.split("/", 1)[1]
             service_request = await client.read("ServiceRequest", sr_id)
             detail["serviceRequest"] = service_request
+            detail["serviceRequestSummary"] = _service_request_summary(service_request)
+
+            requester_ref = (service_request.get("requester") or {}).get("reference", "")
+            performer_ref = ""
+            performers = service_request.get("performer") or []
+            if performers:
+                performer_ref = str((performers[0] or {}).get("reference", "") or "")
+
+            requester_org = await _resolve_organization_from_role_reference(client, requester_ref)
+            performer_org = await _resolve_organization_from_role_reference(client, performer_ref)
+            if requester_org:
+                detail["requesterOrganization"] = requester_org
+            if performer_org:
+                detail["performerOrganization"] = performer_org
         pt_ref = (task.get("for") or {}).get("reference", "")
         if pt_ref.startswith("Patient/"):
             pt_id = pt_ref.split("/", 1)[1]
@@ -1313,8 +1645,12 @@ async def referral_detail(task_id: str) -> Dict[str, Any]:
             detail["patientSummary"] = _patient_summary(pt)
             cond_bundle = await client.search("Condition", f"subject=Patient/{pt_id}&_sort=-recorded-date&_count=20")
             obs_bundle = await client.search("Observation", f"subject=Patient/{pt_id}&_sort=-date&_count=20")
+            proc_bundle = await client.search("Procedure", f"subject=Patient/{pt_id}&_sort=-date&_count=20")
+            dr_bundle = await client.search("DiagnosticReport", f"subject=Patient/{pt_id}&_sort=-date&_count=20")
             detail["conditions"] = [_condition_summary(e.get("resource", {})) for e in cond_bundle.get("entry", [])]
             detail["observations"] = [_observation_summary(e.get("resource", {})) for e in obs_bundle.get("entry", [])]
+            detail["procedures"] = [_procedure_summary(e.get("resource", {})) for e in proc_bundle.get("entry", [])]
+            detail["diagnosticReports"] = [_diagnostic_report_summary(e.get("resource", {})) for e in dr_bundle.get("entry", [])]
 
     except FHIRError as exc:
         raise _fhir_error(exc)
@@ -1328,6 +1664,15 @@ async def update_referral_status(task_id: str, payload: Dict[str, Any] = Body(..
     note = payload.get("note")
     if not new_status:
         raise HTTPException(status_code=400, detail="`status` is required")
+    # FHIR R4 task-status codes are lowercase (e.g. "received", not "Received").
+    new_status = new_status.strip().lower()
+    VALID_TASK_STATUSES = {
+        "draft", "requested", "received", "accepted", "rejected",
+        "ready", "cancelled", "in-progress", "on-hold", "failed",
+        "completed", "entered-in-error",
+    }
+    if new_status not in VALID_TASK_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid task status: {new_status}")
     now = payload.get("lastModified") or _now_iso()
     client = FHIRClient()
 
@@ -1346,6 +1691,12 @@ async def update_referral_status(task_id: str, payload: Dict[str, Any] = Body(..
             task["lastModified"] = now
             if note:
                 task.setdefault("note", []).append({"text": note})
+            # Ensure FHIR narrative is present (dom-6 best-practice).
+            if "text" not in task:
+                task["text"] = {
+                    "status": "generated",
+                    "div": f'<div xmlns="http://www.w3.org/1999/xhtml">Task: {new_status}</div>',
+                }
             result = await client.update("Task", task_id, task)
             method = "PUT"
     except FHIRError as exc:
@@ -1505,6 +1856,10 @@ def _organization_summary(resource: Dict[str, Any]) -> Dict[str, str]:
         "hcpn_identifier": hcpn_identifier or nhfr_identifier,
         "address_text": address_text,
         "postal": postal,
+        "region": psgc_data.get("org_region_display") or psgc_data.get("org_region_code") or "",
+        "province": psgc_data.get("org_province_display") or psgc_data.get("org_province_code") or str(address.get("district", "") or ""),
+        "city": psgc_data.get("org_city_display") or psgc_data.get("org_city_code") or str(address.get("city", "") or ""),
+        "barangay": psgc_data.get("org_barangay_display") or psgc_data.get("org_barangay_code") or "",
     }
     summary.update(psgc_data)
     return summary

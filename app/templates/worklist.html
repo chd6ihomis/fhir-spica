@@ -56,7 +56,7 @@
 
 <script>
 let tasks = [];
-const NEXT = { requested: 'Received', received: 'Accepted', accepted: 'Completed', rejected: 'Diverted'  };
+const NEXT = { requested: 'received', received: 'accepted', accepted: 'completed', rejected: 'cancelled'  };
 const OBS_CHART_COLORS = ['#0c6e29', '#2563eb', '#b45309', '#b91c1c'];
 
 function formatStatusLabel(value) {
@@ -320,6 +320,49 @@ function wireObservationViewToggle(container) {
   });
 }
 
+function computeAge(birthDateStr) {
+  if (!birthDateStr) return '';
+  const today = new Date();
+  const birth = new Date(birthDateStr);
+  let age = today.getFullYear() - birth.getFullYear();
+  const m = today.getMonth() - birth.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) age--;
+  return age < 0 ? '' : String(age) + ' yr' + (age !== 1 ? 's' : '');
+}
+
+function renderProcedureSection(procedures) {
+  if (!procedures || !procedures.length) return '';
+  const rows = procedures.map(pr => `<tr>
+    <td>${escapeHtml(pr.display || pr.code || 'Procedure')}</td>
+    <td class="muted">${escapeHtml(pr.performedDateTime ? formatDateTime(pr.performedDateTime) : '')}</td>
+    <td>${escapeHtml(pr.note || '')}</td>
+  </tr>`).join('');
+  return `<section><h3>Procedures / Treatment Given</h3>
+    <table><thead><tr><th>Procedure</th><th>Date</th><th>Notes</th></tr></thead><tbody>${rows}</tbody></table></section>`;
+}
+
+function renderDiagnosticReportSection(reports) {
+  if (!reports || !reports.length) return '';
+  const rows = reports.map(dr => {
+    const attLinks = (dr.attachments || []).filter(a => a.data || a.url).map(a => {
+      if (a.data) {
+        const mime = a.contentType || 'application/octet-stream';
+        const href = `data:${mime};base64,${a.data}`;
+        return `<a href="${href}" download="${escapeHtml(a.title || 'report')}">${escapeHtml(a.title || 'Download')}</a>`;
+      }
+      return `<a href="${escapeHtml(a.url)}" target="_blank" rel="noopener">${escapeHtml(a.title || 'View')}</a>`;
+    }).join(' ');
+    return `<tr>
+      <td>${escapeHtml(dr.display || dr.code || 'Report')}</td>
+      <td class="muted">${escapeHtml(dr.effectiveDateTime ? formatDateTime(dr.effectiveDateTime) : '')}</td>
+      <td>${escapeHtml(dr.conclusion || '')}</td>
+      <td>${attLinks}</td>
+    </tr>`;
+  }).join('');
+  return `<section><h3>Laboratory / Diagnostic Reports</h3>
+    <table><thead><tr><th>Report</th><th>Date</th><th>Conclusion</th><th>Attachment</th></tr></thead><tbody>${rows}</tbody></table></section>`;
+}
+
 function wireConditionViewToggle(container) {
   const buttons = container.querySelectorAll('.cond-view-btn');
   const panels = container.querySelectorAll('.cond-panel');
@@ -415,7 +458,10 @@ async function openDetail(id) {
     const d = await API.get('/api/referrals/' + id);
     const p = d.patientSummary || {};
     const sr = d.serviceRequest || {};
+    const srSummary = d.serviceRequestSummary || {};
     const task = d.task || {};
+    const requesterOrg = d.requesterOrganization || {};
+    const performerOrg = d.performerOrganization || {};
 
     // --- Patient summary ---
     const idsHtml = (p.identifiers || [])
@@ -435,23 +481,37 @@ async function openDetail(id) {
     const authoredOn = formatDateTime(task.authoredOn);
     const timeCalled = task.authoredOn ? formatDateTime(task.authoredOn, true) : '—';
     const requesterRef = sr.requester || task.requester || {};
-    const requesterOrgName = requesterRef.display || '—';
-    const requesterOrgId = String(requesterRef.reference || '').startsWith('Organization/')
+    const requesterOrgName = requesterOrg.name || srSummary.requesterOrgName || requesterRef.display || '—';
+    const requesterOrgId = requesterOrg.org_id || srSummary.requesterOrg || (String(requesterRef.reference || '').startsWith('Organization/')
       ? String(requesterRef.reference || '').split('/')[1] || ''
-      : '';
+      : '');
     const performerRef = ((sr.performer || [])[0]) || (task.owner || {});
-    const ownerOrgName = performerRef.display || '—';
-    const ownerOrgId = String(performerRef.reference || '').startsWith('Organization/')
+    const ownerOrgName = performerOrg.name || srSummary.performerOrgName || performerRef.display || '—';
+    const ownerOrgId = performerOrg.org_id || srSummary.performerOrg || (String(performerRef.reference || '').startsWith('Organization/')
       ? String(performerRef.reference || '').split('/')[1] || ''
-      : '';
+      : '');
     const addressParts = [];
     if (p.patient_line) addressParts.push(p.patient_line);
-    if (p.barangay_code) addressParts.push(`Barangay ${p.barangay_code}`);
-    if (p.city_code) addressParts.push(`City/Municipality ${p.city_code}`);
-    if (p.province_code) addressParts.push(`Province ${p.province_code}`);
-    if (p.region_code) addressParts.push(`Region ${p.region_code}`);
+    if (p.barangay_display || p.barangay_code) addressParts.push(p.barangay_display || `Barangay ${p.barangay_code}`);
+    if (p.city_display || p.city_code) addressParts.push(p.city_display || `City/Municipality ${p.city_code}`);
+    if (p.province_display || p.province_code) addressParts.push(p.province_display || `Province ${p.province_code}`);
+    if (p.region_display || p.region_code) addressParts.push(p.region_display || `Region ${p.region_code}`);
     if (p.patient_postal) addressParts.push(p.patient_postal);
     const patientAddress = addressParts.length ? addressParts.join(', ') : (p.address || '—');
+
+    function formatOrgLocation(org) {
+      if (!org || typeof org !== 'object') return '';
+      const parts = [];
+      if (org.address_text) parts.push(org.address_text);
+      if (org.barangay) parts.push(org.barangay);
+      if (org.city) parts.push(org.city);
+      if (org.province) parts.push(org.province);
+      if (org.region) parts.push(org.region);
+      if (org.postal) parts.push(org.postal);
+      return parts.filter(Boolean).join(', ');
+    }
+    const requesterLocation = formatOrgLocation(requesterOrg);
+    const performerLocation = formatOrgLocation(performerOrg);
 
     document.getElementById('detailBody').innerHTML = `
       <section>
@@ -459,7 +519,7 @@ async function openDetail(id) {
         <dl class="kv">
           <dt>Name</dt><dd>${escapeHtml(p.name || '—')}</dd>
           <dt>Sex</dt><dd>${escapeHtml(p.gender || '—')}</dd>
-          <dt>Birth date</dt><dd>${escapeHtml(p.birthDate ? formatDate(p.birthDate) : '—')}</dd>
+          <dt>Birth date</dt><dd>${escapeHtml(p.birthDate ? formatDate(p.birthDate) : '—')}${p.birthDate ? ` <span class="muted">(Age ${computeAge(p.birthDate)})</span>` : ''}</dd>
           <dt>Address</dt><dd>${escapeHtml(patientAddress)}</dd>
           <dt>Identifiers</dt><dd>${idsHtml}</dd>
         </dl>
@@ -472,7 +532,9 @@ async function openDetail(id) {
           <dt>Category</dt><dd>${escapeHtml(srCategory)}</dd>
           <dt>Reason for referral</dt><dd>${escapeHtml(srReason)}</dd>
           <dt>Referring organization</dt><dd>${escapeHtml(requesterOrgName)}${requesterOrgId ? ` <span class="id-chip">Org ${escapeHtml(requesterOrgId)}</span>` : ''}</dd>
+          ${requesterLocation ? `<dt>Referring org address</dt><dd>${escapeHtml(requesterLocation)}</dd>` : ''}
           <dt>Receiving organization</dt><dd>${escapeHtml(ownerOrgName)}${ownerOrgId ? ` <span class="id-chip">Org ${escapeHtml(ownerOrgId)}</span>` : ''}</dd>
+          ${performerLocation ? `<dt>Receiving org address</dt><dd>${escapeHtml(performerLocation)}</dd>` : ''}
           <dt>Date of referral / authored</dt><dd>${escapeHtml(authoredOn)}</dd>
           <dt>Time called</dt><dd>${escapeHtml(timeCalled)}</dd>
           <dt>Last modified</dt><dd>${escapeHtml(task.lastModified ? formatDateTime(task.lastModified) : '—')}</dd>
@@ -480,7 +542,9 @@ async function openDetail(id) {
         </dl>
       </section>
       ${renderConditionSection(d.conditions || [], { heading: 'Conditions / Diagnoses', emptyText: 'No conditions recorded' })}
-      ${renderObservationSection(d.observations || [])}`;
+      ${renderObservationSection(d.observations || [])}
+      ${renderProcedureSection(d.procedures || [])}
+      ${renderDiagnosticReportSection(d.diagnosticReports || [])}`;
     wireConditionViewToggle(document.getElementById('detailBody'));
     wireObservationViewToggle(document.getElementById('detailBody'));
     document.getElementById('detailJson').textContent = JSON.stringify(d, null, 2);
